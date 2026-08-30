@@ -127,9 +127,9 @@ make eval       # score the baseline
 make ablation   # regenerate the table above
 ```
 
-Python 3.11–3.13. Not 3.14 yet: `onnxruntime`, under `fastembed`, publishes
-wheels for new releases months late, and building it from source is not
-something a one-command setup can absorb.
+Python 3.11 or newer, 3.14 included. The container pins 3.12 — a reproducible
+deployment wants a known-good interpreter rather than the newest one — but
+nothing here requires it.
 
 ## Licence
 

@@ -4,10 +4,11 @@ version = "0.1.0"
 description = "Evidence-grounded retrieval over scientific literature, with the numbers to say whether it works"
 readme = "README.md"
 license = { text = "MIT" }
-# Floor 3.11 for the typing used throughout; ceiling 3.14 because onnxruntime
-# (under fastembed) lags new releases by months and building it from source is
-# not something a `docker compose up` promise can absorb.
-requires-python = ">=3.11,<3.14"
+# Floor 3.11 for the typing used throughout. No ceiling: onnxruntime 1.29
+# (under fastembed) ships a 3.14 wheel, verified on this machine. The container
+# still pins 3.12 — a reproducible deployment wants a known-good interpreter,
+# not the newest one — but there is no reason to stop anyone running 3.14.
+requires-python = ">=3.11"
 
 dependencies = [
   # MIT, and exposes per-character font size — which is what makes heading

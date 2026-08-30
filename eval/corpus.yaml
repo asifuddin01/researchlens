@@ -11,6 +11,23 @@
 # good as the labeller's ability to tell a supporting passage from a plausible
 # one, and that ability is domain-specific.
 #
+# --- Two corpora, and the tension between them -------------------------------
+#
+# This file is the *reproducible* corpus: papers a stranger who clones the repo
+# can fetch, so the ablation table in the README can be reproduced.
+#
+# The corpus actually being labelled is a local literature review — single-cell
+# genomics, gene regulatory network inference, causal discovery — loaded with
+#   make ingest DIR="/path/to/papers"
+# Labelling quality is bounded by the labeller's domain knowledge, and that
+# knowledge lives in the papers they have read, not in a generic ML set.
+#
+# Those two facts pull apart: better labels come from the local corpus, and
+# reproducibility comes from this one. The resolution worth doing is to rebuild
+# this file *from* the local corpus, because most of it is already open access
+# (Nature Communications, BMC Bioinformatics, bioRxiv, PMC) and resolvable by
+# DOI. Until that is done, the README table should say which corpus produced it.
+#
 # Fetch with: make corpus
 
 papers:

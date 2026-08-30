@@ -21,12 +21,13 @@ from pathlib import Path
 
 from eval.metrics import RetrievalScore, aggregate
 from researchlens.ingest.chunk import chunk_corpus, fingerprint
-from researchlens.ingest.parse import parse_pdf
+from researchlens.ingest.library import load_library
 from researchlens.retrieval.pipeline import ABLATION, RetrievalConfig, RetrievalPipeline
 from researchlens.types import Chunk, Document
 
 ROOT = Path(__file__).resolve().parent.parent
 PDF_DIR = ROOT / "data" / "pdfs"
+INDEX_DIR = ROOT / "data" / "index"
 QUESTIONS = ROOT / "eval" / "questions.jsonl"
 
 
@@ -63,23 +64,20 @@ def load_questions(path: Path = QUESTIONS) -> tuple[list[dict], str]:
 
 
 def load_corpus() -> tuple[list[Document], list[Chunk]]:
-    pdfs = sorted(PDF_DIR.glob("*.pdf"))
-    if not pdfs:
+    """Load the parsed library, then chunk it.
+
+    Parsing goes through the on-disk cache rather than happening here, so every
+    configuration in an ablation sees byte-identical documents. Re-parsing
+    between rows would let an extraction difference appear as a retrieval one.
+    """
+    try:
+        docs, skipped = load_library(PDF_DIR, INDEX_DIR)
+    except FileNotFoundError:
         sys.exit(
             f"No PDFs in {PDF_DIR}.\n"
-            "Fetch the corpus first:  python scripts/fetch_corpus.py"
+            "Fetch the corpus first:  python scripts/fetch_corpus.py\n"
+            "Or point it at your own folder:  make ingest DIR=/path/to/papers"
         )
-
-    docs: list[Document] = []
-    skipped: list[str] = []
-    for p in pdfs:
-        try:
-            docs.append(parse_pdf(p))
-        except ValueError as e:
-            # A paper that will not parse is reported and excluded, never
-            # silently indexed. An empty document in the index depresses
-            # Recall@K with no visible cause.
-            skipped.append(str(e))
 
     for msg in skipped:
         print(f"  skipped: {msg}", file=sys.stderr)

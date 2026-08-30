@@ -20,6 +20,10 @@ install: ## create the venv and install everything
 corpus: ## download the evaluation corpus (~25 open-access papers)
 	$(PY) scripts/fetch_corpus.py
 
+# Point at any folder of PDFs. Parses once into data/index; later runs reuse it.
+ingest: ## parse a folder of papers into the library cache (DIR=/path/to/papers)
+	$(PY) -m researchlens.ingest.library $(or $(DIR),data/pdfs)
+
 test: ## run the unit tests
 	$(PY) -m pytest -q
 

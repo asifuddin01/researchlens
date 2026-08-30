@@ -67,6 +67,37 @@ _NUMBERING = re.compile(r"^\s*(\d+(\.\d+)*|[IVXLC]+|[A-Z])[.)]?\s+")
 # than by anything else.
 _MAX_HEADING_WORDS = 12
 
+# Journal furniture, set in the same large or bold type as real headings.
+# Running heads ("Article", "OPEN ACCESS"), figure callouts and licence lines
+# are typographically indistinguishable from a section heading and, left in,
+# fragment a paper into dozens of one-paragraph sections whose passages then
+# inherit the wrong parent.
+_FURNITURE = re.compile(
+    r"^\s*(open\s*access|article|resource|review|correspondence|perspective|"
+    r"brief\s+communication|letter|editorial|preprint|"
+    r"(extended\s+data\s+)?(fig(ure)?|table|supplementary|supp)\b|"
+    r"see\s+also|in\s+brief|highlights|graphical\s+abstract|"
+    r"https?://|www\.|doi:|©|creative\s+commons)",
+    re.I,
+)
+
+# Figure panel labels: "a", "a b", "f g h i". Every token a single letter.
+_PANEL_LABELS = re.compile(r"^\s*[a-z]([\s,]+[a-z])*\s*$", re.I)
+
+# Horizontal gap, in points, below which two words are treated as one word.
+# pdfplumber defaults to 3, which merges words in the tight typography used by
+# Cell Press and several other journals: whole abstracts extract as
+# "Weidentifyover1millioncandidate", which no query can match by any means,
+# lexical or dense. Verified across this corpus — 3 merges, 2 does not, and
+# lowering it further changes nothing. (pdfplumber 0.11 has no
+# x_tolerance_ratio, so this cannot scale with font size.)
+_X_TOLERANCE = 2.0
+
+# Horizontal gap, in points, that separates two independent runs of text on the
+# same visual band — a column gutter or the space beside a margin box. Well
+# above any inter-word space at body size, well below a real gutter.
+_GUTTER_GAP = 18.0
+
 # Below this many characters per page, the file has no usable text layer.
 # See the density check in `parse_pdf` for why this is not `if not lines`.
 _MIN_CHARS_PER_PAGE = 100
@@ -89,16 +120,122 @@ def _is_bold(fontname: str) -> bool:
     return "bold" in f or "black" in f or "heavy" in f or f.endswith("-b")
 
 
+def _split_on_gutters(words: list[dict]) -> list[list[dict]]:
+    """Split one horizontal band of words wherever a wide gap separates them.
+
+    Words sharing a `top` are not necessarily on the same printed line. A
+    two-column paper puts two unrelated sentences at the same height, and a
+    review article's margin box sits level with the body text beside it.
+    Joining them produces "descriptive atlasing Introduction towards inferring"
+    — a sentence that exists in no column and matches no query.
+
+    The threshold is well above any inter-word space at body size and well
+    below a column gutter, so ordinary prose is never split.
+    """
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: w["x0"])
+    groups: list[list[dict]] = [[words[0]]]
+    for w in words[1:]:
+        if w["x0"] - groups[-1][-1]["x1"] > _GUTTER_GAP:
+            groups.append([w])
+        else:
+            groups[-1].append(w)
+    return groups
+
+
+def _column_split(fragments: list[tuple[float, float, float]], width: float) -> float | None:
+    """Find the x at which this page divides into two text regions, if any.
+
+    `fragments` are (x0, x1, top). Full-width elements — the title, a spanning
+    figure caption — are expected and are *not* disqualifying: an earlier
+    version required that nothing straddle the candidate line, which meant one
+    title above two columns defeated column detection for the whole page, and
+    every real paper has one.
+
+    A split is accepted when it divides the page into two well-populated sides
+    with few straddlers. The straddlers are then handled as separators by
+    `_order_fragments`, not discarded.
+    """
+    if len(fragments) < 6:
+        return None
+    best: float | None = None
+    best_score = 0.0
+    for f in (0.40, 0.45, 0.48, 0.50, 0.52, 0.55, 0.60, 0.66, 0.72):
+        x = width * f
+        left = sum(1 for a, b, _ in fragments if b <= x)
+        right = sum(1 for a, b, _ in fragments if a >= x)
+        straddle = len(fragments) - left - right
+        if not left or not right:
+            continue
+        # Too much crossing the line means this is one column of text, not two.
+        if straddle > len(fragments) * 0.25:
+            continue
+        score = min(left, right) / len(fragments)
+        if score > best_score:
+            best, best_score = x, score
+    # Below this, the smaller side is a page number or a stray label.
+    return best if best_score >= 0.06 else None
+
+
+def _order_fragments(
+    fragments: list[tuple[float, float, float, list[dict]]], split: float | None
+) -> list[tuple[float, float, float, list[dict]]]:
+    """Put fragments into reading order.
+
+    With no split, top-to-bottom then left-to-right. With one, the page is a
+    sequence of bands separated by full-width elements; within each band the
+    left region is read in full before the right. That is the order a person
+    reads it in, and therefore the order in which the sentences are whole.
+    """
+    fragments = sorted(fragments, key=lambda f: (f[2], f[0]))
+    if split is None:
+        return fragments
+
+    out: list[tuple[float, float, float, list[dict]]] = []
+    left: list = []
+    right: list = []
+
+    def flush() -> None:
+        out.extend(left)
+        out.extend(right)
+        left.clear()
+        right.clear()
+
+    for frag in fragments:
+        x0, x1, _top, _ws = frag
+        if x1 <= split:
+            left.append(frag)
+        elif x0 >= split:
+            right.append(frag)
+        else:
+            # Spans both regions: it closes the band above and starts a new one.
+            flush()
+            out.append(frag)
+    flush()
+    return out
+
+
 def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
-    """Group words into visual lines.
+    """Group words into visual lines, respecting columns and margin boxes.
 
     pdfplumber returns words, not lines. Words on the same printed line share a
-    `top` within rounding, so they are bucketed on a rounded `top`. The
+    `top` within rounding, so they are bucketed on a rounded `top` — the
     tolerance is deliberately coarse (0.5pt) because subscripts and inline maths
     sit fractionally off the baseline and should not start a new line.
+
+    Bucketing on `top` alone is not enough, because a page is not one column of
+    text. Bands are split at wide horizontal gaps, and where the page divides
+    cleanly in two, the left region is emitted in full before the right — which
+    is the order a person reads it in, and therefore the order in which its
+    sentences are whole.
     """
     try:
-        words = page.extract_words(extra_attrs=["size", "fontname"], use_text_flow=False)
+        words = page.extract_words(
+            extra_attrs=["size", "fontname"],
+            use_text_flow=False,
+            x_tolerance=_X_TOLERANCE,
+        )
     except Exception:
         # A page that is a scanned image, or otherwise has no text layer.
         return []
@@ -108,9 +245,17 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
         key = round(w["top"] * 2) / 2
         buckets.setdefault(key, []).append(w)
 
-    lines: list[_Line] = []
+    # (x0, x1, top, words) for each horizontal run of words.
+    fragments: list[tuple[float, float, float, list[dict]]] = []
     for top in sorted(buckets):
-        ws = sorted(buckets[top], key=lambda w: w["x0"])
+        for group in _split_on_gutters(buckets[top]):
+            fragments.append((group[0]["x0"], group[-1]["x1"], top, group))
+
+    split = _column_split([(f[0], f[1], f[2]) for f in fragments], float(page.width))
+    ordered = _order_fragments(fragments, split)
+
+    lines: list[_Line] = []
+    for _x0, _x1, top, ws in ordered:
         text = " ".join(w["text"] for w in ws).strip()
         if not text:
             continue
@@ -165,6 +310,11 @@ def _looks_like_heading(line: _Line, body: float) -> bool:
         return False
     # Page numbers, running heads, stray figure labels.
     if re.fullmatch(r"[\d\s.\-–—]+", line.text):
+        return False
+    # Too short to name a division; usually a dropped cap or a panel letter.
+    if len(line.text.strip()) <= 2:
+        return False
+    if _PANEL_LABELS.match(line.text) or _FURNITURE.match(line.text):
         return False
 
     larger = line.size >= body + 0.6
@@ -227,6 +377,23 @@ def _extract_authors(lines: list[_Line], title: str, body: float) -> list[str]:
     return [n for n in names if 2 <= len(n.split()) <= 5][:20]
 
 
+def _heading_levels(headings: list[_Line]) -> dict[float, int]:
+    """Map each heading font size to a nesting level, largest size = level 1.
+
+    Papers signal hierarchy typographically: a section heading is set larger
+    than its subsections. That signal is already in the extracted geometry and
+    was previously discarded, which is why most passages classified as "other" —
+    "3.2 Training details" is a real heading with no IMRaD name of its own, and
+    without its parent it says nothing about where the passage came from.
+
+    Sizes are bucketed at 0.5pt because the same logical level can vary by a
+    fraction between pages, and treating those as distinct levels would produce
+    a nesting depth of nine on a paper with three.
+    """
+    sizes = sorted({round(h.size * 2) / 2 for h in headings}, reverse=True)
+    return {s: i + 1 for i, s in enumerate(sizes)}
+
+
 def parse_pdf(path: str | Path) -> Document:
     """Parse one PDF into a `Document` with real sections and page spans.
 
@@ -266,6 +433,16 @@ def parse_pdf(path: str | Path) -> Document:
     title = _extract_title(lines)
     authors = _extract_authors(lines, title, body)
 
+    # Headings are collected first so their sizes can be ranked into levels;
+    # a heading's level is only meaningful relative to the other headings in
+    # the same document.
+    heading_lines = [
+        ln for ln in lines
+        if _looks_like_heading(ln, body)
+        and (ln.page > 1 or _classify(ln.text) != "other")
+    ]
+    levels = _heading_levels(heading_lines)
+
     # Walk the lines once, opening a new section at every heading.
     sections: list[Section] = []
     cur_kind: SectionKind = "title"
@@ -273,6 +450,9 @@ def parse_pdf(path: str | Path) -> Document:
     cur_page = lines[0].page
     buf: list[str] = []
     last_page = lines[0].page
+    # (level, kind) of each enclosing heading, outermost first. A subsection
+    # with no name of its own inherits the kind of the section containing it.
+    stack: list[tuple[int, SectionKind]] = []
 
     def close(end_page: int) -> None:
         text = " ".join(buf).strip()
@@ -302,7 +482,23 @@ def parse_pdf(path: str | Path) -> Document:
         if heading:
             close(last_page)
             buf = []
-            cur_kind = _classify(ln.text)
+
+            level = levels.get(round(ln.size * 2) / 2, len(levels) + 1)
+            named = _classify(ln.text)
+
+            # Leave any sections this heading closes: everything at the same
+            # level or deeper.
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+
+            if named == "other" and stack:
+                # An unnamed subsection belongs to whatever contains it, so
+                # "Data preprocessing" inside Methods is still methods.
+                cur_kind = stack[-1][1]
+            else:
+                cur_kind = named
+
+            stack.append((level, cur_kind))
             cur_heading = _NUMBERING.sub("", ln.text).strip() or ln.text
             cur_page = ln.page
         else:
