@@ -120,12 +120,18 @@ eval/
 ## Development
 
 ```bash
-make install    # venv + dependencies
-make corpus     # fetch the open-access papers
-make test       # unit tests
-make eval       # score the baseline
-make ablation   # regenerate the table above
+make install                     # venv + dependencies
+make corpus                      # fetch the open-access papers
+make ingest DIR=~/my/papers      # or parse your own folder (cached)
+make search Q="how is a GRN inferred"   # inspect retrieval directly
+make test                        # unit tests
+make eval                        # score the baseline
+make ablation                    # regenerate the table above
 ```
+
+`make search` is worth using before trusting any number: reading what actually
+comes back for a query separates a chunking problem from a retrieval problem,
+and it needs no ground truth to be informative.
 
 Python 3.11 or newer, 3.14 included. The container pins 3.12 — a reproducible
 deployment wants a known-good interpreter rather than the newest one — but

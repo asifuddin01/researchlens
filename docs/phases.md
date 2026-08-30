@@ -14,7 +14,8 @@ delta instead of an intuition.
 - [x] `ingest/chunk.py` — passages that can cite themselves
 - [x] `ingest/library.py` — parse once, cache, reuse across ablation rows
 - [x] `eval/metrics.py` — Recall@K, MRR, nDCG, longhand and unit-tested
-- [x] `retrieval/dense.py` — the baseline retriever
+- [x] `retrieval/dense.py` — the baseline retriever, embeddings cached
+- [x] `scripts/search.py` — inspect retrieval without ground truth
 - [ ] `eval/questions.jsonl` — **60 hand-written questions.** The long pole, and
       the one file that cannot be generated: if a model writes the questions and
       a model judges the answers, the table measures self-agreement.
@@ -70,6 +71,13 @@ than naming the exact page. Going finer means tracking which page each sentence
 landed on through the line grouping, for a citation a reader can already act on.
 
 **Ingest is slow.** Roughly 30 s/paper at `_X_TOLERANCE = 2.0`, dominated by
-pdfplumber's character-level extraction. Acceptable because it is cached and
-runs once. If it becomes painful, GROBID is both faster and better at this —
-see the note in `parse.py`.
+pdfplumber's character-level extraction; 30 papers take ~15 minutes. Embedding
+those 3,364 passages with bge-small on CPU is a further several minutes. Both
+are cached and run once, which is why neither has been optimised — but if the
+corpus grows past ~100 papers, ingest is the first thing that will need to
+become parallel, and GROBID is both faster and better at the parsing half.
+
+**Corpus composition.** 30 papers, 1,021 sections, 3,364 passages, 61% of them
+in a named section. Books were excluded deliberately: five of them produced
+~5,800 further passages and would dominate the index, and a 487-page monograph
+is a different retrieval problem from a 12-page paper.

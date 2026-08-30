@@ -30,6 +30,9 @@ test: ## run the unit tests
 lint:
 	$(VENV)/bin/ruff check .
 
+search: ## query the corpus from the command line (Q="your question")
+	$(PY) scripts/search.py $(Q)
+
 eval: ## score the baseline configuration
 	$(PY) -m eval.run --config "dense only"
 
