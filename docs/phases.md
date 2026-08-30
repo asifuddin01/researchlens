@@ -70,6 +70,26 @@ cite less precisely.
 than naming the exact page. Going finer means tracking which page each sentence
 landed on through the line grouping, for a citation a reader can already act on.
 
+**Embedding throughput.** Measured on 192 real passages (bge-small, 8 cores):
+
+| configuration | rate | full corpus |
+|---|---|---|
+| fastembed default | 2.2/s | 25 min |
+| `threads=8` | 4.0/s | 14 min |
+| **CoreML provider** | **5.7/s** | **9.8 min** |
+| `threads=8, parallel=0` | 1.2/s | 48 min |
+
+Two results worth keeping. CoreML is the clear winner where it exists, so it is
+requested by name and detected rather than assumed — the container runs Linux,
+where it does not exist. And fastembed's `parallel` multiprocessing is *slower*:
+each worker loads its own copy of the model, and at this corpus size that reload
+dominates. It is deliberately unused.
+
+Even at 5.7/s this is not fast for a 33M-parameter model. It is tolerable only
+because embeddings are cached on a key covering model, instruction, chunk ids
+and text. If the corpus grows much past 100 papers, this is the second thing
+that needs attention after parsing.
+
 **Ingest is slow.** Roughly 30 s/paper at `_X_TOLERANCE = 2.0`, dominated by
 pdfplumber's character-level extraction; 30 papers take ~15 minutes. Embedding
 those 3,364 passages with bge-small on CPU is a further several minutes. Both

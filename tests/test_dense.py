@@ -25,7 +25,8 @@ class StubEncoder:
     def __init__(self):
         self.calls = 0
 
-    def embed(self, texts):
+    def embed(self, texts, **kwargs):
+        # **kwargs mirrors fastembed, which takes batch_size and parallel.
         self.calls += 1
         for t in texts:
             for word, vec in self.VECTORS.items():
