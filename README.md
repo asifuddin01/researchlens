@@ -1,0 +1,136 @@
+# ResearchLens
+
+Evidence-grounded retrieval over scientific literature. Every claim in an answer
+resolves to a passage — a paper, a section, a page — and every architectural
+choice has to justify itself with a number.
+
+Runs entirely on your machine. No API key, no document leaving the host.
+
+```bash
+git clone https://github.com/asifuddin01/researchlens
+cd researchlens
+docker compose up
+```
+
+Then open <http://localhost:8000>. The first run downloads a ~2 GB model once.
+
+---
+
+## Why this is not a RAG demo
+
+Three things, in the order they were built.
+
+**The measuring rig came first.** Sixty questions over an open-access corpus,
+each hand-labelled with the passages that genuinely answer it. Written before
+any retrieval code, against a deliberately weak baseline, so that every
+component added afterwards arrives with a measured delta rather than an
+intuition.
+
+**The ground truth is written by hand.** If a language model writes the
+questions and a language model judges the answers, the table below measures a
+model's agreement with itself. `eval/questions.jsonl` is the most valuable file
+in this repository and the most tedious one to produce.
+
+**The table is generated.** `make ablation` runs every configuration through
+one code path and rewrites this file. Nothing here is typed by a human, so
+nothing here can drift away from the code.
+
+## Retrieval ablation
+
+Each row adds exactly one component to the row above it, over an identical
+parser, chunker and index — so the difference between adjacent rows is
+attributable to the named component and to nothing else.
+
+<!-- ablation:start -->
+
+_Not yet measured. Run `make corpus && make ablation`._
+
+<!-- ablation:end -->
+
+Latency is in the table on purpose. A component that buys three points of
+recall for 8 ms and one that buys three points for 400 ms are different
+engineering decisions, and a table reporting only quality hides which is on
+offer.
+
+## How it works
+
+```
+PDF ─ parse ─ chunk ─┬─ BM25   ─┐
+   (sections,        │          ├─ RRF ─ cross-encoder ─ context ─ LLM ─ answer
+    page spans)      └─ dense  ─┘                                        + citations
+```
+
+**Structure first.** A PDF is not a string. `researchlens/ingest/parse.py` finds
+headings by font geometry — papers set headings larger or bolder than body text,
+a signal present in essentially every typeset paper — so a passage knows which
+section it came from and which page it was printed on. That is what makes a
+citation nameable rather than approximate.
+
+**Hybrid, because the two halves fail differently.** A dense encoder maps
+"Dice 0.91", "SwinUNETR" and "KiTS23" into neighbourhoods of things that mean
+something similar, which for a metric value or a dataset name is exactly wrong.
+BM25 matches them literally and is helpless at paraphrase. Reciprocal rank
+fusion combines them by position rather than score, so no normalisation has to
+be tuned per corpus.
+
+**Reranking, provisionally.** A bi-encoder never sees query and passage
+together; a cross-encoder scores the pair jointly and can notice the right
+metric on the wrong dataset. It may not help here — on a small corpus where
+hybrid retrieval already puts the labelled passage in the top five there is
+little room above it. If the ablation says so, that row stays in the table
+unchanged.
+
+## Local and hosted
+
+The default generator is local (Ollama). A hosted OpenAI-compatible endpoint is
+optional and stays optional — with no key configured, the local model serves
+every request.
+
+Because retrieval is identical on both sides, switching provider isolates
+generation. That makes the toggle a live ablation rather than a convenience,
+and the harness reports faithfulness and citation accuracy per model over the
+same retrieved evidence.
+
+## The public demo
+
+<https://asifuddin.com/researchlens> runs the same container in `demo` mode —
+fixed corpus, uploads off, rate-limited at the edge. It is a read-only exhibit,
+not the system: a public deployment cannot honestly claim "your documents never
+leave your machine", so it does not.
+
+## Layout
+
+```
+researchlens/
+  types.py            record shapes; everything depends on these and they on nothing
+  config.py           every value has a working default
+  ingest/parse.py     PDF → sections with page spans
+  ingest/chunk.py     sections → passages that can cite themselves
+  retrieval/          bm25 · dense · fusion · rerank
+  retrieval/pipeline.py   the ablation axis — one code path, four configurations
+  generate/           provider protocol + local and hosted implementations
+  api/                FastAPI; the local UI and the demo share it
+eval/
+  corpus.yaml         the papers, open-access only
+  questions.jsonl     hand-written ground truth
+  metrics.py          Recall@K · MRR · nDCG, longhand and unit-tested
+  run.py              the harness
+```
+
+## Development
+
+```bash
+make install    # venv + dependencies
+make corpus     # fetch the open-access papers
+make test       # unit tests
+make eval       # score the baseline
+make ablation   # regenerate the table above
+```
+
+Python 3.11–3.13. Not 3.14 yet: `onnxruntime`, under `fastembed`, publishes
+wheels for new releases months late, and building it from source is not
+something a one-command setup can absorb.
+
+## Licence
+
+MIT.

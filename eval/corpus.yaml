@@ -1,0 +1,59 @@
+# The evaluation corpus.
+#
+# Open-access papers only, and nothing drawn from embargoed work. Three of the
+# four research plates on asifuddin.com are under a disclosure guard, and a
+# retrieval index is precisely the mechanism that surfaces a withheld number
+# sideways in an answer. The rule is simple enough to hold to: if it is not
+# already public at the URL below, it is not in this file.
+#
+# Weighted toward medical imaging and segmentation because that is where the
+# questions can be written from actual knowledge — the labelling is only as
+# good as the labeller's ability to tell a supporting passage from a plausible
+# one, and that ability is domain-specific.
+#
+# Fetch with: make corpus
+
+papers:
+  - id: unet
+    title: "U-Net: Convolutional Networks for Biomedical Image Segmentation"
+    arxiv: "1505.04597"
+
+  - id: attention-is-all-you-need
+    title: "Attention Is All You Need"
+    arxiv: "1706.03762"
+
+  - id: vit
+    title: "An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale"
+    arxiv: "2010.11929"
+
+  - id: swin
+    title: "Swin Transformer: Hierarchical Vision Transformer using Shifted Windows"
+    arxiv: "2103.14030"
+
+  - id: swin-unetr
+    title: "Swin UNETR: Swin Transformers for Semantic Segmentation of Brain Tumors in MRI Images"
+    arxiv: "2201.01266"
+
+  - id: unetr
+    title: "UNETR: Transformers for 3D Medical Image Segmentation"
+    arxiv: "2103.10504"
+
+  - id: nnunet
+    title: "nnU-Net: Self-adapting Framework for U-Net-Based Medical Image Segmentation"
+    arxiv: "1809.10486"
+
+  - id: sam
+    title: "Segment Anything"
+    arxiv: "2304.02643"
+
+  - id: medsam
+    title: "Segment Anything in Medical Images"
+    arxiv: "2304.12306"
+
+  - id: transunet
+    title: "TransUNet: Transformers Make Strong Encoders for Medical Image Segmentation"
+    arxiv: "2102.04306"
+
+# Add papers here and rerun `make corpus`. Twenty-five is the target: enough
+# that retrieval has to discriminate, few enough that one person can read them
+# well enough to label questions honestly.

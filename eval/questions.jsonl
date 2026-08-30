@@ -1,0 +1,24 @@
+// Ground truth. Hand-written — this is the point.
+//
+// If a model writes these questions and a model judges the answers, the
+// ablation table measures a model's agreement with itself and nothing else.
+// Sixty questions is a few evenings of work and it is what makes every other
+// number in this repository mean something.
+//
+// Format, one JSON object per line:
+//   question         what a researcher would actually type
+//   relevant_chunks  chunk ids that genuinely support an answer, found by
+//                    reading — not by running retrieval and accepting the top
+//                    hits, which would label the system correct by definition
+//   answer_facts     short strings that a correct answer must contain; used by
+//                    the Phase III faithfulness check, ignored before then
+//   kind             lookup | comparison | synthesis | absent
+//   note             why this question is here, for whoever re-labels later
+//
+// "absent" questions matter as much as the rest: a question the corpus cannot
+// answer, where the correct behaviour is to decline. Without them the system is
+// never scored on refusal, and refusal is a prediction.
+//
+// The _meta row records the chunking parameters these ids were written under.
+// The harness refuses to score if the chunker has changed since.
+{"_meta": true, "chunking": "c1000-o180", "labelled_by": "hand", "labelled_on": "2026-08-31"}

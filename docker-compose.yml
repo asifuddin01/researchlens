@@ -1,0 +1,95 @@
+# The reproducible deployment. `docker compose up` on a clean machine must
+# produce a working system with no API key and no manual steps — that is the
+# repository's central claim, and anything here that needs filling in first
+# quietly falsifies it.
+#
+# Two services rather than one, and the split is not cosmetic. `retrieval`
+# holds the ONNX embedding and reranker models and stays near 500 MB; `ollama`
+# holds a multi-gigabyte language model. Keeping them apart is what lets the
+# public demo suspend the small one for a sub-second wake while the large one
+# scales to zero — Fly cannot snapshot a machine much above 2 GB, so a single
+# combined container would have to cold-boot every time. See docs/deploy.md.
+
+name: researchlens
+
+services:
+  # The system. Parsing, chunking, retrieval, reranking, the API.
+  retrieval:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      RESEARCHLENS_MODE: ${RESEARCHLENS_MODE:-local}
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b-instruct}
+      # Absent by default, and absent is a supported state: with no hosted
+      # provider configured the local one serves every request.
+      HOSTED_BASE_URL: ${HOSTED_BASE_URL:-}
+      HOSTED_API_KEY: ${HOSTED_API_KEY:-}
+      HOSTED_MODEL: ${HOSTED_MODEL:-claude-sonnet-5}
+      DATA_DIR: /app/data
+    volumes:
+      # Papers and the built index live on the host, so rebuilding the image
+      # never costs a re-ingest.
+      - ./data:/app/data
+      # ONNX weights are ~400 MB and are fetched on first use. Caching them
+      # outside the image keeps the image small and the second start fast.
+      - model-cache:/home/app/.cache
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      # Generous: the first start loads two ONNX models from disk.
+      start_period: 90s
+    restart: unless-stopped
+
+  # The default generator. Present in the default service set on purpose — if
+  # running the local model took an extra flag, "no API key required" would be
+  # true only for people who read far enough to find the flag.
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  # Pulls the model once, then exits. Without this the first question a user
+  # asks fails with a model-not-found error several minutes into their first
+  # run, which reads as a broken project rather than a missing download.
+  model-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        MODEL="${OLLAMA_MODEL:-qwen2.5:3b-instruct}"
+        if ollama list | grep -q "$${MODEL%%:*}"; then
+          echo "$$MODEL already present."
+        else
+          echo "Pulling $$MODEL (~2 GB, once)..."
+          ollama pull "$$MODEL"
+        fi
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: "no"
+
+volumes:
+  ollama-models:
+  model-cache:

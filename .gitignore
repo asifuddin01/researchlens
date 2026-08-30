@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+
+# The corpus is fetched, not committed: the PDFs are large and redistributing
+# them is a licensing question this repository does not need to answer.
+# `scripts/fetch_corpus.py` rebuilds it from eval/corpus.yaml.
+data/pdfs/*.pdf
+data/index/
+
+# eval/questions.jsonl is NOT ignored. It is hand-written ground truth and the
+# most valuable file here.

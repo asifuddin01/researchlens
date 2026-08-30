@@ -1,0 +1,48 @@
+[project]
+name = "researchlens"
+version = "0.1.0"
+description = "Evidence-grounded retrieval over scientific literature, with the numbers to say whether it works"
+readme = "README.md"
+license = { text = "MIT" }
+# Floor 3.11 for the typing used throughout; ceiling 3.14 because onnxruntime
+# (under fastembed) lags new releases by months and building it from source is
+# not something a `docker compose up` promise can absorb.
+requires-python = ">=3.11,<3.14"
+
+dependencies = [
+  # MIT, and exposes per-character font size — which is what makes heading
+  # detection possible without a GROBID service. PyMuPDF is faster and AGPL;
+  # the licence would travel to this repository, and the point of publishing
+  # it is that people can use it.
+  "pdfplumber>=0.11",
+  # ONNX embeddings and reranking. Small enough to keep the retrieval service
+  # under the memory ceiling that lets it suspend rather than cold-boot.
+  "fastembed>=0.4",
+  "rank-bm25>=0.2.2",
+  "numpy>=1.26",
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "httpx>=0.27",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.7"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["researchlens*", "eval*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
