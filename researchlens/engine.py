@@ -122,10 +122,10 @@ class Engine:
         chunks carry an `arxiv:` id and an "abstract" page, so a reader is
         never shown an abstract as though it were a passage from a full paper.
         """
-        from researchlens.live import arxiv
+        from researchlens.live import arxiv, search as live_search
 
         try:
-            papers = await arxiv.search(question, max_results=max_results)
+            papers = await live_search.search(question, per_source=max_results // 2 or 3)
         except Exception:
             # Live search is an enhancement, not a dependency. A network
             # failure must degrade to a corpus-only answer, never to an error:
