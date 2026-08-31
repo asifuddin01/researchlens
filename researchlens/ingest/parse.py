@@ -398,24 +398,68 @@ def _looks_like_heading(line: _Line, body: float) -> bool:
     return larger or emphasised or numbered or named
 
 
-def _extract_title(lines: list[_Line]) -> str:
-    """The title is the largest text on the first page, read in order.
+# Cover-page banners that are set larger than the title on PMC and several
+# journal templates, and so win a naive "largest text" rule.
+_TITLE_BANNER = re.compile(
+    r"^(hhs public access|nih public access|author manuscript|europe pmc|"
+    r"published in final edited form|open access|research article|"
+    r"original (research )?article|review article|brief communication|"
+    r"downloaded from|see discussions, stats|preprint|"
+    r"\d+\.?\s+(introduction|abstract|background|related work)\b)",
+    re.I,
+)
 
-    Titles wrap, so every line at the maximum size on page 1 is joined rather
-    than only the first. Lines above the title (a journal banner, an arXiv
-    stamp) are set smaller and drop out on their own.
+
+def _plausible_title(text: str) -> bool:
+    """Whether a candidate string could be a paper's title.
+
+    Guards against the failure this replaced: taking every line at the largest
+    size on page 1 returned "T", "M", "w" and "1 3" for 19 of 101 papers,
+    because the biggest glyph on the page is often a decorative drop cap or a
+    journal logo rather than the title. A title shown in a citation is the
+    first thing a reader checks, so a wrong one is worse than most defects.
     """
-    first = [ln for ln in lines if ln.page == 1]
+    words = text.split()
+    if len(words) < 2 or len(text) < 15:
+        return False
+    if _TITLE_BANNER.match(text.strip()):
+        return False
+    # Letter-spaced display type extracts as "d e e e e e p o n n p e" and
+    # "V D C N L -S I R" — plausible by every other measure, and meaningless.
+    singles = sum(1 for w in words if len(w) == 1)
+    if singles > len(words) * 0.5:
+        return False
+    letters = sum(c.isalpha() for c in text)
+    # A running head of page numbers and rule characters is not a title.
+    return letters >= len(text) * 0.5
+
+
+def _extract_title(lines: list[_Line]) -> str:
+    """The largest text on page 1 that could actually be a title.
+
+    Size tiers are walked from largest down, and the first tier whose lines
+    form something title-shaped wins. Titles wrap, so every line in the
+    winning tier is joined rather than only the first.
+    """
+    first = [ln for ln in lines if ln.page == 1 and ln.text.strip()]
     if not first:
         return "Untitled"
-    top_size = max(ln.size for ln in first)
-    parts = [
-        ln.text
-        for ln in first
-        if ln.size >= top_size - 0.1 and not re.match(r"^arxiv:", ln.text, re.I)
-    ]
-    title = " ".join(parts).strip()
-    return re.sub(r"\s+", " ", title) or "Untitled"
+
+    for size in sorted({round(ln.size, 1) for ln in first}, reverse=True):
+        parts = [
+            ln.text
+            for ln in first
+            if abs(round(ln.size, 1) - size) < 0.15
+            and not re.match(r"^arxiv:", ln.text, re.I)
+            and not _FURNITURE.match(ln.text)
+        ]
+        candidate = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        if _plausible_title(candidate):
+            # A tier occasionally sweeps in a whole abstract; a title does not
+            # run to 300 characters, so keep the leading sentence-ish part.
+            return candidate[:300].strip()
+
+    return "Untitled"
 
 
 def _extract_authors(lines: list[_Line], title: str, body: float) -> list[str]:

@@ -72,3 +72,36 @@ def test_end_to_end_on_a_real_string():
     assert _dehyphenate(broken, vocab) == (
         "claim to predict gene expression caused by perturbations of single-cell control"
     )
+
+
+# --- title plausibility ------------------------------------------------------
+# Each string here was produced by the parser on a real paper in the corpus.
+
+from researchlens.ingest.parse import _plausible_title  # noqa: E402
+
+
+def test_a_real_title_is_accepted():
+    assert _plausible_title("Auto-Encoding Variational Bayes")
+    assert _plausible_title("Mixtral of Experts")
+
+
+def test_a_drop_cap_is_rejected():
+    """The original failure: the largest glyph on page 1 is a decorative
+    initial, which returned "M" for 19 of 101 papers."""
+    assert not _plausible_title("M")
+    assert not _plausible_title("1 3")
+
+
+def test_a_pmc_cover_banner_is_rejected():
+    assert not _plausible_title("HHS Public Access")
+    assert not _plausible_title("Author Manuscript")
+
+
+def test_letter_spaced_display_type_is_rejected():
+    """Plausible by length and word count, meaningless as a title."""
+    assert not _plausible_title("d e e e e e p o n n p e")
+    assert not _plausible_title("V D C N L -S I R")
+
+
+def test_a_section_heading_is_rejected():
+    assert not _plausible_title("1 Introduction X")

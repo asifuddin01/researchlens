@@ -90,3 +90,34 @@ def test_fragments_too_short_to_carry_a_claim_are_dropped():
 def test_fingerprint_tracks_the_parameters_labels_were_written_under():
     assert fingerprint(1000, 180) == "c1000-o180"
     assert fingerprint(800, 100) != fingerprint(1000, 180)
+
+
+def test_a_reference_list_is_dropped_even_inside_another_section():
+    """Heading detection puts bibliographies inside "METHODS" often enough to
+    matter: on the real corpus one such passage was returned at rank 2 for a
+    genuine query. Skipping the `references` section alone does not catch it.
+    """
+    refs = (
+        "[24] Z. Jiang, F. F. Xu, L. Gao, and G. Neubig, Active retrieval augmented "
+        "generation, arXiv preprint arXiv:2305.06983, 2023. "
+        "[25] A. Asai, Z. Wu, Y. Wang, A. Sil, and H. Hajishirzi, Self-rag: Learning "
+        "to retrieve, generate and critique, arXiv preprint arXiv:2310.11511, 2023. "
+        "[26] P. Lewis, E. Perez, A. Piktus, and F. Petroni, Retrieval-augmented "
+        "generation for knowledge-intensive NLP tasks, arXiv preprint, 2020. "
+    )
+    doc = _doc(_section("methods", "METHODS", 6, 21, refs))
+    assert chunk_document(doc) == []
+
+
+def test_prose_that_cites_heavily_is_kept():
+    """The guard must not eat a Related Work paragraph, which is where a lot of
+    genuinely useful answers live."""
+    prose = (
+        "Retrieval-augmented generation [12] is regarded as a useful method to "
+        "address these issues, since it enhances the input questions of generative "
+        "language models with retrieved documents. It usually provides an extra "
+        "knowledge source from a specific corpus, and has been shown to reduce "
+        "hallucination substantially on knowledge-intensive tasks. "
+    ) * 2
+    doc = _doc(_section("related", "Related Work", 2, 3, prose))
+    assert len(chunk_document(doc)) >= 1

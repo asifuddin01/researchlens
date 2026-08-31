@@ -29,6 +29,35 @@ DEFAULT_OVERLAP = 180
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[])")
 
+# Markers of a bibliography: numbered citation labels, arXiv stubs, and the
+# "F. M. Surname" initials that appear nowhere else at density.
+_CITE_LABEL = re.compile(r"\[\d{1,3}\]|arXiv preprint|doi:\s*10\.", re.I)
+_CITE_INITIALS = re.compile(r"\b[A-Z]\.\s?[A-Z]?\.?\s+[A-Z][a-z]+")
+
+#: Citation markers per 100 characters above which a passage is a reference
+#: list rather than prose. Measured on this corpus: ordinary prose sits near
+#: zero even when it cites heavily, and true bibliography passages run well
+#: above 2.5.
+_BIBLIOGRAPHY_DENSITY = 2.5
+
+
+def looks_like_bibliography(text: str) -> bool:
+    """Whether a passage is a reference list wearing another section's name.
+
+    Skipping the `references` section is not enough. Heading detection puts a
+    bibliography inside "METHODS" often enough to matter: on this corpus one
+    such passage was returned at rank 2 for a real query — a dense field of
+    author names and venues matches almost anything, and can never support a
+    claim about what a paper found.
+
+    Density rather than a keyword, because the giveaway is not any single
+    marker but how many of them share a paragraph.
+    """
+    if not text:
+        return False
+    hits = len(_CITE_LABEL.findall(text)) + len(_CITE_INITIALS.findall(text))
+    return hits / max(len(text) / 100, 1) > _BIBLIOGRAPHY_DENSITY
+
 
 def _split_sentences(text: str) -> list[str]:
     """Split on sentence boundaries, conservatively.
@@ -69,7 +98,7 @@ def chunk_document(
         def flush() -> None:
             nonlocal ordinal, buf, buf_len
             text = " ".join(buf).strip()
-            if len(text) < 80:  # too short to carry a claim
+            if len(text) < 80 or looks_like_bibliography(text):
                 buf, buf_len = [], 0
                 return
             chunks.append(
