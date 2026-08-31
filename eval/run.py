@@ -87,20 +87,26 @@ def load_corpus() -> tuple[list[Document], list[Chunk]]:
     return docs, chunk_corpus(docs)
 
 
-def build_pipeline(chunks: list[Chunk], need_rerank: bool) -> RetrievalPipeline:
-    """Build and index every retriever once, for all configurations.
+def build_pipeline(chunks: list[Chunk], configs: list[RetrievalConfig]) -> RetrievalPipeline:
+    """Build and index once the retrievers these configurations actually use.
 
-    Indexing per configuration would let an index difference masquerade as a
-    retrieval difference, which is the one thing an ablation must not permit.
+    Indexing once rather than per configuration matters: re-indexing between
+    rows would let an index difference masquerade as a retrieval difference,
+    which is the one thing an ablation must not permit.
+
+    Only what is needed is constructed. Building all three unconditionally made
+    the dense-only baseline fail on BM25's NotImplementedError, which defeats
+    the entire point of the baseline — it exists so Phase I can be measured
+    before Phase II is written.
     """
     from researchlens.retrieval.bm25 import BM25Retriever
     from researchlens.retrieval.dense import DenseRetriever
     from researchlens.retrieval.rerank import CrossEncoderReranker
 
     pipe = RetrievalPipeline(
-        dense=DenseRetriever(),
-        bm25=BM25Retriever(),
-        reranker=CrossEncoderReranker() if need_rerank else None,
+        dense=DenseRetriever() if any(c.use_dense for c in configs) else None,
+        bm25=BM25Retriever() if any(c.use_bm25 for c in configs) else None,
+        reranker=CrossEncoderReranker() if any(c.use_rerank for c in configs) else None,
     )
     pipe.index(chunks)
     return pipe
@@ -146,12 +152,29 @@ def main() -> None:
         file=sys.stderr,
     )
 
+    if not questions:
+        # The expected state until the corpus has been labelled, so it gets a
+        # real message rather than a traceback from deep inside the metrics.
+        sys.exit(
+            f"No questions in {QUESTIONS.name} yet — nothing to score.\n\n"
+            "The ground truth is written by hand, and that is the point: if a\n"
+            "model writes the questions and a model judges the answers, the\n"
+            "ablation measures a model's agreement with itself.\n\n"
+            "Browse the corpus to find passages:\n"
+            '  make label ARGS="--papers"\n'
+            '  make label ARGS="--paper <id> --section results"\n'
+            "  make label ARGS='--grep \"linear baseline\"'\n\n"
+            "Write the question first, from what you know the paper says, then\n"
+            "find the passage. The reverse order — running a search and writing\n"
+            "a question to fit what came back — labels the system correct by\n"
+            "construction and every configuration then scores well."
+        )
+
     configs = ABLATION if args.ablation else [
         c for c in ABLATION if c.label == args.config
     ] or [ABLATION[0]]
 
-    need_rerank = any(c.use_rerank for c in configs)
-    pipe = build_pipeline(chunks, need_rerank)
+    pipe = build_pipeline(chunks, configs)
 
     print(RetrievalScore.header())
     for config in configs:
