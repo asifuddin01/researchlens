@@ -78,19 +78,40 @@ EXAMPLES = [
 ]
 
 
-# Small enough to load inside a ZeroGPU allocation, large enough to follow the
-# citation instructions. The 3B used locally is the same family, so answers on
-# the Space and on a laptop differ in fluency rather than in kind.
-GPU_MODEL = os.getenv("GPU_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+# The same 3B the local build runs, so the Space and a laptop differ in speed
+# rather than in what they say. 7B was the first choice and was wrong for a
+# reason worth recording: its weights are about 15 GB, and they were being
+# fetched inside the GPU allocation, which would need 125 MB/s sustained to
+# finish inside the window. The call died with "connection to the server was
+# lost" and the Space stayed healthy, which made it look like a frontend fault.
+GPU_MODEL = os.getenv("GPU_MODEL", "Qwen/Qwen2.5-3B-Instruct")
 
 _gpu_pipe = None
 
 
+def _prefetch_model() -> None:
+    """Fetch the weights to disk at startup.
+
+    Downloading needs no GPU, so doing it inside the allocation spends the
+    window on network transfer and leaves none for generation. This runs once
+    while the Space boots; the GPU call then only has to load from local disk.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(GPU_MODEL, allow_patterns=["*.json", "*.safetensors", "*.txt"])
+        print(f"  weights for {GPU_MODEL} are on disk", flush=True)
+    except Exception as e:  # noqa: BLE001
+        # Not fatal: the GPU call will fetch them itself, just slowly. Saying
+        # so beats a first question that mysteriously times out.
+        print(f"  could not prefetch {GPU_MODEL}: {e}", flush=True)
+
+
 def _load_gpu_model():
-    """Load the generation model. Called inside a GPU allocation, never before.
+    """Move the model onto the GPU. Called inside an allocation, never before.
 
     ZeroGPU attaches hardware only for the duration of a decorated call, so a
-    model loaded at import time would be loaded without a GPU present and stay
+    model loaded at import time would be loaded with no GPU present and stay
     on the CPU for the life of the Space.
     """
     global _gpu_pipe
@@ -120,9 +141,10 @@ def _generate_on_gpu(system: str, user: str, max_tokens: int = 700) -> str:
 
 
 if ON_ZERO_GPU:
-    # 120 seconds: enough for a first call that also loads the model, and well
-    # inside what ZeroGPU allows.
-    _generate_on_gpu = spaces.GPU(duration=120)(_generate_on_gpu)
+    # The weights are already on disk by now, so this window covers loading
+    # them onto the GPU and generating — not downloading them.
+    _generate_on_gpu = spaces.GPU(duration=180)(_generate_on_gpu)
+    _prefetch_model()
 
 
 def _evidence_markdown(citations) -> str:
