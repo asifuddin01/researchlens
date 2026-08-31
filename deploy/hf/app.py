@@ -128,7 +128,7 @@ def _load_gpu_model():
     return _gpu_pipe
 
 
-def _generate_on_gpu(system: str, user: str, max_tokens: int = 700) -> str:
+def _generate_on_gpu(system: str, user: str, max_tokens: int = 500) -> str:
     pipe = _load_gpu_model()
     out = pipe(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -141,9 +141,15 @@ def _generate_on_gpu(system: str, user: str, max_tokens: int = 700) -> str:
 
 
 if ON_ZERO_GPU:
-    # The weights are already on disk by now, so this window covers loading
-    # them onto the GPU and generating — not downloading them.
-    _generate_on_gpu = spaces.GPU(duration=180)(_generate_on_gpu)
+    # 60 seconds, not the 180 first tried. ZeroGPU pads the request — asking
+    # for 180 was rejected as "the requested GPU duration (270s) is larger than
+    # the maximum allowed", a 1.5x multiplier applied silently. Sixty is the
+    # default and is comfortably inside the cap.
+    #
+    # It is also enough, now that the weights are on disk before the call:
+    # what happens inside the window is a load from local storage and a few
+    # hundred tokens of generation, not a 6 GB download.
+    _generate_on_gpu = spaces.GPU(duration=60)(_generate_on_gpu)
     _prefetch_model()
 
 
