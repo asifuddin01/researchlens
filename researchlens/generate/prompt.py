@@ -28,7 +28,12 @@ Rules:
 - A sentence stating a fact from the passages must carry a citation.
 - Do not add background knowledge, even if you are confident it is correct.
 - Quote exact numbers, dataset names and model names as they appear.
-- Be concise. Three or four sentences is usually enough."""
+- Be concise. Three or four sentences is usually enough.
+
+If the question asks what is *current*, *recent*, *trending*, or what a field
+is doing now, you are being asked something a fixed set of papers cannot fully
+answer. Say what these particular papers show, name that limit in one clause,
+and do not present the passages as a survey of the field."""
 
 NO_EVIDENCE = (
     "I could not find sufficient evidence in the indexed papers to answer that."
@@ -59,6 +64,27 @@ def build_context(evidence: list[Retrieved], max_chars: int = 9000) -> str:
     return "\n".join(parts)
 
 
+_SURVEY_WORDS = (
+    "current", "recent", "trend", "trends", "trending", "nowadays", "lately",
+    "state of the art", "state-of-the-art", "emerging", "latest", "these days",
+)
+
+
+def asks_for_a_survey(question: str) -> bool:
+    """Whether the question asks about a field rather than about the papers.
+
+    "What are the current trends in long-context language models?" cannot be
+    answered from a fixed corpus, and answering it anyway is the failure that
+    looks most like success: the model writes a fluent survey from what it
+    already believed, decorated with whatever citations retrieval happened to
+    return. Observed directly — the system answered a question about current
+    LLM trends from *Attention Is All You Need* (2017) and BERT (2018), with
+    real citations and no indication that its evidence was eight years old.
+    """
+    q = question.lower()
+    return any(w in q for w in _SURVEY_WORDS)
+
+
 def build_prompt(question: str, evidence: list[Retrieved], history=None) -> tuple[str, str]:
     """Return (system, user). Empty evidence is the caller's error to avoid."""
     if not evidence:
@@ -76,10 +102,19 @@ def build_prompt(question: str, evidence: list[Retrieved], history=None) -> tupl
         q, a = history[-1]
         turns = f"\nEarlier in this conversation:\nQ: {q}\nA: {a[:400]}\n"
 
+    scope = ""
+    if asks_for_a_survey(question):
+        scope = (
+            "\nThis question asks about a field, not about these passages. "
+            "Answer only what these papers show, and say in one clause that "
+            "this is a fixed set of indexed papers rather than a survey of "
+            "current literature.\n"
+        )
+
     user = f"""Passages:
 
 {context}
-{turns}
+{turns}{scope}
 Question: {question}
 
 Answer using only the passages above, citing each claim by number."""
