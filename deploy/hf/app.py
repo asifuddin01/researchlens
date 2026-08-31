@@ -239,7 +239,20 @@ def _evidence_markdown(citations, mine: set[str] | None = None) -> str:
 #: claim that it runs with no API key is about the *local* build, which is
 #: where it matters; a hosted demo borrowing a hosted model breaks nothing.
 HF_ROUTER = "https://router.huggingface.co/v1"
-FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+#: Deliberately a larger model than the one on the GPU, not a smaller one.
+#: A fallback is usually a downgrade; here it is the reverse, because the 3B
+#: that fits a ZeroGPU allocation is the weakest link in the whole system —
+#: it declines answerable questions and picks the wrong passage out of a good
+#: pool. The GPU keeps priority because it costs nothing per call.
+#:
+#: 72B rather than 7B for a duller reason: checked against the router's own
+#: model index, Qwen2.5-7B-Instruct is served by one provider and this by
+#: three. A fallback with a single point of failure is not one.
+#:
+#: Override with FALLBACK_MODEL if the account's inference credits run short —
+#: meta-llama/Llama-3.1-8B-Instruct is the cheap end of the same shelf.
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "Qwen/Qwen2.5-72B-Instruct")
 
 
 def _fallback_provider():
