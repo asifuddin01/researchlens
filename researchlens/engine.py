@@ -12,6 +12,7 @@ make the demo unusable and the memory ceiling unreachable.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -356,6 +357,100 @@ class Engine:
     def drop_uploads(self, session: str) -> None:
         if self.uploads is not None:
             self.uploads.drop(session)
+
+    async def similar_papers(
+        self, session: str | None, doc_id: str = "", max_results: int = 9
+    ) -> dict:
+        """Recent work related to a paper the reader added.
+
+        The corpus cannot answer this — it is fixed, and the question is about
+        what else exists — so it goes to the live indexes directly. Lives on
+        the engine rather than in a UI because both the API and the Space need
+        it, and two copies of a query ladder would have drifted the first time
+        one of them was tuned.
+        """
+        docs = self.uploaded_documents(session)
+        if not docs:
+            return {"error": "Add a paper first, then I can look for work like it."}
+        doc = next((d for d in docs if d.doc_id == doc_id), docs[-1])
+        title = (doc.title or "").strip()
+        if len(title) < 8:
+            return {"error": f"{title!r} is too short a title to search on."}
+
+        from researchlens.live import arxiv as live_arxiv, search as live_search
+
+        def key(t: str) -> str:
+            return "".join(ch for ch in t.lower() if ch.isalnum())[:60]
+
+        own = key(title)
+        per = max(2, max_results // max(len(live_search.SOURCES), 1))
+
+        # A ladder, widening until there is enough to be worth reading. A full
+        # title is the most precise query and for a specific paper often
+        # matches nothing but itself — PubMed joins terms with AND, so a long
+        # title asks for every word at once.
+        #
+        # Five years rather than the two "what is current" wants: related work
+        # is not a recency question, and the method a paper descends from is
+        # often a decade old.
+        words = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9-]+", title) if len(w) > 3]
+        ladder = [title]
+        if len(words) > 5:
+            ladder.append(" ".join(words[:5]))
+        if len(words) > 3:
+            ladder.append(" ".join(words[:3]))
+
+        found, seen, used = [], set(), []
+        for q in ladder:
+            used.append(q)
+            try:
+                batch = await live_search.search(q, per_source=per, since_days=1825)
+            except Exception as e:  # noqa: BLE001
+                self.last_live_error = f"{type(e).__name__}: {e}"
+                return {"error": f"Literature search failed: {e}"}
+            for paper in batch:
+                k = key(paper.title)
+                # The paper itself is the best match for its own title, and
+                # returning it as related work is a joke at the reader's
+                # expense.
+                if k == own or k in seen:
+                    continue
+                seen.add(k)
+                found.append(paper)
+            if len(found) >= max_results:
+                break
+
+        # Ranked against the source paper, because widening the query is what
+        # makes this usable and also what makes it noisy: a three-word rung
+        # matched "anatomy" and returned a paper on anatomy education. The
+        # floor is relative to the best candidate — these scores move with the
+        # query, so what can be said is that one three points below the best is
+        # not about the same subject.
+        if found and self.pipeline is not None and self.pipeline.reranker is not None:
+            against = f"{title}. {doc.abstract[:600]}".strip()
+            chunks = live_arxiv.to_chunks(found)
+            by_id = {c.chunk_id: p for c, p in zip(chunks, found)}
+            ranked = self.pipeline.reranker.rerank(against, chunks, len(chunks))
+            if ranked:
+                floor = ranked[0][1] - 3.0
+                found = [by_id[cid] for cid, score in ranked if score >= floor]
+
+        return {
+            "for_title": doc.title,
+            "for_doc_id": doc.doc_id,
+            "query": " \u2192 ".join(used),
+            "results": [
+                {
+                    "title": p.title,
+                    "authors": p.authors[:4],
+                    "published": p.published,
+                    "url": p.url,
+                    "source": p.source,
+                    "abstract": p.abstract[:400],
+                }
+                for p in found[:max_results]
+            ],
+        }
 
     def corpus_support(self, question: str, threshold: float = 0.62) -> int:
         """How many distinct papers the corpus offers on this question.

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import secrets
 import sys
 import time
@@ -527,6 +528,38 @@ def forget_papers(session: str = "") -> dict:
     return {"session": session, "papers_open": 0}
 
 
+def my_papers(session: str = "") -> dict:
+    """What this caller currently has open.
+
+    Exists because an uploaded paper was invisible after the message about it
+    scrolled away, and a reader could not tell whether it was still there. A
+    page that shows a list can answer that without asking.
+    """
+    docs = ENGINE.uploaded_documents(session or None)
+    return {
+        "session": session,
+        "papers": [
+            {"doc_id": d.doc_id, "title": d.title, "pages": d.n_pages} for d in docs
+        ],
+        "limit": MAX_PAPERS_PER_SESSION,
+    }
+
+
+def find_similar(session: str = "", doc_id: str = "", max_results: int = 9) -> dict:
+    """Recent work related to a paper the reader added.
+
+    The engine owns this; the two surfaces must not each have their own query
+    ladder. Abstracts, not full text, and labelled as such wherever they
+    appear — a paper found this way is a lead, not a finding.
+    """
+    try:
+        return asyncio.run(
+            ENGINE.similar_papers(session or None, doc_id, max_results)
+        )
+    except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
+        return {"error": f"Literature search failed: {e}"}
+
+
 def ask_json(
     question: str,
     provider: str = "",
@@ -749,6 +782,8 @@ Runs locally with no API key —
     gr.api(corpus_stats, api_name="corpus_stats")
     gr.api(add_paper, api_name="add_paper")
     gr.api(forget_papers, api_name="forget_papers")
+    gr.api(my_papers, api_name="my_papers")
+    gr.api(find_similar, api_name="find_similar")
 
     timing_box.render()
     with gr.Accordion("Evidence", open=True):

@@ -52,6 +52,12 @@ class AskRequest(BaseModel):
     live: str = Field(default="auto", pattern="^(auto|always|never)$")
 
 
+class SimilarRequest(BaseModel):
+    session: str = Field(min_length=8, max_length=64, pattern="^[A-Za-z0-9_-]+$")
+    doc_id: str | None = Field(default=None, max_length=64)
+    k: int = Field(default=9, ge=1, le=25)
+
+
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=500)
     k: int = Field(default=8, ge=1, le=30)
@@ -308,6 +314,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "sections": len(doc.sections),
             "papers_open": len(engine.uploaded_documents(session)),
         }
+
+    @app.post("/similar")
+    async def similar(req: SimilarRequest):
+        """Related work for a paper this session added.
+
+        Not answerable from the corpus by construction: it is fixed, and the
+        question is about what else exists. The same engine call the Space
+        makes, so the two cannot answer differently.
+        """
+        result = await engine.similar_papers(req.session, req.doc_id or "", req.k)
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
 
     @app.delete("/ingest/{session}")
     async def forget(session: str):
