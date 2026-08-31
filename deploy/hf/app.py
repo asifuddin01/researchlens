@@ -481,7 +481,34 @@ def ask_json(
         else:
             raw = "".join(_sync_stream(question, evidence, None, provider))
     except Exception as e:  # noqa: BLE001
-        return {"error": f"The model did not answer: {e}"}
+        # Retrieval needs no GPU. When only the writer is unavailable — a spent
+        # ZeroGPU quota is the usual reason — the evidence is still there and
+        # is most of what this system is for. Returning it is both more useful
+        # than an error and more honest than a generated answer would have
+        # been: these are the passages, unsummarised, with nothing between the
+        # reader and the source.
+        return {
+            "text": "",
+            "evidence_only": True,
+            "reason": str(e),
+            "citations": [
+                {
+                    "marker": i,
+                    "chunk_id": r.chunk.chunk_id,
+                    "doc_title": r.chunk.doc_title,
+                    "section_heading": r.chunk.section_heading,
+                    "pages": r.chunk.pages,
+                    "quote": r.chunk.text[:400],
+                    "live": is_live(r.chunk.chunk_id),
+                }
+                for i, r in enumerate(evidence, start=1)
+            ],
+            "model": "",
+            "retrieval_ms": round(retrieval_ms, 1),
+            "generation_ms": 0.0,
+            "passages": len(evidence),
+            "papers": len({r.chunk.doc_id for r in evidence}),
+        }
     generation_ms = (time.perf_counter() - started) * 1000.0
 
     text, citations = resolve(raw, evidence)

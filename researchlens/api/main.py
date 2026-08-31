@@ -44,6 +44,12 @@ class AskRequest(BaseModel):
     doc_ids: list[str] | None = Field(default=None, max_length=200)
     #: Include this session's uploaded papers in the evidence.
     session: str | None = SESSION
+    #: Whether to reach outside the indexed corpus. "auto" decides from the
+    #: shape of the question, which is the right default and the only one the
+    #: engine can justify; "always" and "never" exist because a reader asking
+    #: for a survey knows something the question wording may not carry, and a
+    #: reader who wants only the indexed papers should be able to say so.
+    live: str = Field(default="auto", pattern="^(auto|always|never)$")
 
 
 class SearchRequest(BaseModel):
@@ -179,6 +185,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             answer = await engine.ask(
                 req.question,
                 req.provider,
+                live={"auto": None, "always": True, "never": False}[req.live],
                 doc_ids=set(req.doc_ids) if req.doc_ids else None,
                 session=req.session,
             )
@@ -209,6 +216,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 stream = engine.ask_stream(
                     req.question,
                     req.provider,
+                    live={"auto": None, "always": True, "never": False}[req.live],
                     doc_ids=set(req.doc_ids) if req.doc_ids else None,
                     session=req.session,
                 )
