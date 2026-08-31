@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -41,7 +42,30 @@ import gradio as gr  # noqa: E402
 
 from researchlens.config import Settings  # noqa: E402
 from researchlens.engine import Engine  # noqa: E402
+from researchlens.generate.citations import is_grounded, resolve  # noqa: E402
+from researchlens.generate.prompt import (  # noqa: E402
+    NO_EVIDENCE,
+    asks_for_a_survey as _asks_for_survey,
+    build_prompt,
+)
 from researchlens.live.arxiv import is_live  # noqa: E402
+
+# ZeroGPU: a GPU is attached only while a decorated function runs, and a Space
+# on that hardware must declare at least one or it refuses to start —
+# "No @spaces.GPU function detected during startup", which is exactly how this
+# first failed.
+#
+# Satisfying that with a stub would be a lie told to a scheduler. The honest
+# answer is to use the GPU, and it is also the better one: generation on the
+# attached A10G needs no API key, which is the claim the whole project rests
+# on and which a hosted endpoint quietly breaks.
+try:
+    import spaces  # type: ignore
+
+    ON_ZERO_GPU = True
+except ImportError:
+    # Not on a ZeroGPU Space — running locally, or on CPU hardware.
+    ON_ZERO_GPU = False
 
 ENGINE = Engine(Settings.from_env())
 ENGINE.load()
@@ -52,6 +76,53 @@ EXAMPLES = [
     "What datasets are used to benchmark gene regulatory network inference?",
     "What are the current trends in long-context language models?",
 ]
+
+
+# Small enough to load inside a ZeroGPU allocation, large enough to follow the
+# citation instructions. The 3B used locally is the same family, so answers on
+# the Space and on a laptop differ in fluency rather than in kind.
+GPU_MODEL = os.getenv("GPU_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+_gpu_pipe = None
+
+
+def _load_gpu_model():
+    """Load the generation model. Called inside a GPU allocation, never before.
+
+    ZeroGPU attaches hardware only for the duration of a decorated call, so a
+    model loaded at import time would be loaded without a GPU present and stay
+    on the CPU for the life of the Space.
+    """
+    global _gpu_pipe
+    if _gpu_pipe is None:
+        import torch
+        from transformers import pipeline
+
+        _gpu_pipe = pipeline(
+            "text-generation",
+            model=GPU_MODEL,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    return _gpu_pipe
+
+
+def _generate_on_gpu(system: str, user: str, max_tokens: int = 700) -> str:
+    pipe = _load_gpu_model()
+    out = pipe(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        max_new_tokens=max_tokens,
+        do_sample=True,
+        temperature=0.2,
+        return_full_text=False,
+    )
+    return out[0]["generated_text"].strip()
+
+
+if ON_ZERO_GPU:
+    # 120 seconds: enough for a first call that also loads the model, and well
+    # inside what ZeroGPU allows.
+    _generate_on_gpu = spaces.GPU(duration=120)(_generate_on_gpu)
 
 
 def _evidence_markdown(citations) -> str:
@@ -71,11 +142,52 @@ def _evidence_markdown(citations) -> str:
     return "\n".join(rows)
 
 
+def _ask_on_gpu(question: str) -> tuple[str, str, str]:
+    """Retrieve with the engine, generate on the attached GPU, then check.
+
+    Retrieval and grounding are the engine's, unchanged — only the call that
+    produces text differs. The rules that make an answer trustworthy live
+    downstream of the model and apply here identically: the model is never
+    invoked without evidence, markers are resolved against the passages that
+    were actually retrieved, an invented one is removed, and an answer left
+    with nothing supported becomes a refusal.
+    """
+    started = time.perf_counter()
+    evidence, retrieval_ms = ENGINE.retrieve(question)
+
+    if ENGINE.settings and question and _asks_for_survey(question):
+        fetched = asyncio.run(ENGINE.live_evidence(question))
+        if fetched:
+            evidence = ENGINE._merge_live(question, fetched, evidence)
+
+    if not evidence:
+        return NO_EVIDENCE, "", f"retrieval {retrieval_ms:.0f} ms"
+
+    system, user = build_prompt(question, evidence)
+    gen_started = time.perf_counter()
+    raw = _generate_on_gpu(system, user)
+    generation_ms = (time.perf_counter() - gen_started) * 1000.0
+
+    text, citations = resolve(raw, evidence)
+    if not is_grounded(text, citations):
+        text, citations = NO_EVIDENCE, []
+
+    timing = (
+        f"{GPU_MODEL} on ZeroGPU · retrieval {retrieval_ms:.0f} ms "
+        f"· generation {generation_ms:.0f} ms"
+    )
+    _ = time.perf_counter() - started
+    return text, _evidence_markdown(citations), timing
+
+
 def ask(question: str, provider: str) -> tuple[str, str, str]:
     question = (question or "").strip()
     if len(question) < 3:
         return "Ask a question about the indexed papers.", "", ""
+
     try:
+        if provider == "gpu":
+            return _ask_on_gpu(question)
         answer = asyncio.run(ENGINE.ask(question, provider))
     except ValueError as e:
         return f"**{e}**", "", ""
@@ -89,7 +201,14 @@ def ask(question: str, provider: str) -> tuple[str, str, str]:
     return answer.text, _evidence_markdown(answer.citations), timing
 
 
-PROVIDERS = list(ENGINE.settings.providers)
+# On ZeroGPU the attached GPU is the best option and needs no key, so it leads.
+# Anything else the instance has configured follows it.
+PROVIDERS = (["gpu"] if ON_ZERO_GPU else []) + [
+    p for p in ENGINE.settings.providers
+    if p != "local" or not ON_ZERO_GPU
+]
+if not PROVIDERS:
+    PROVIDERS = ["hosted"]
 
 with gr.Blocks(title="ResearchLens", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
@@ -141,18 +260,14 @@ This is a read-only exhibit of a system that runs locally with no API key —
     question.submit(ask, [question, provider], [answer_box, evidence_box, timing_box])
 
 
-# Gradio is built on FastAPI, so the health endpoint the portfolio page probes
-# can be added to the same app rather than needing a second service.
-@demo.app.get("/health")
-def health():
-    return {
-        "status": "ok" if ENGINE.ready else "loading",
-        "mode": ENGINE.settings.mode,
-        "papers": len(ENGINE.documents),
-        "passages": len(ENGINE.chunks),
-        "providers": [{"name": p, "model": "", "ready": True} for p in PROVIDERS],
-    }
-
+# No custom /health here, deliberately. Gradio builds its FastAPI app inside
+# launch(), so a route decorated onto `demo.app` beforehand is silently
+# discarded — the endpoint returned 404 while the app served fine, which is
+# the worst kind of broken.
+#
+# Nothing needs it either: the portfolio page embeds this Space in an iframe
+# rather than probing it, and the probe it does run is for an instance on the
+# reader's own machine. Gradio's own /config answers "is it up".
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", "7860")))
