@@ -429,6 +429,87 @@ def respond(message, history, provider, papers, live_mode, session):
     yield (preamble + text, _evidence_markdown(citations, mine), timing, session, choices)
 
 
+def corpus_stats() -> dict:
+    """What the running system actually holds, so a page never states a figure
+    the system disagrees with."""
+    return {
+        "papers": len(ENGINE.documents),
+        "passages": len(ENGINE.chunks),
+        "model": GPU_MODEL if ON_ZERO_GPU else ENGINE.settings.ollama_model,
+        "sources": ["arxiv", "pubmed", "openalex"],
+    }
+
+
+def ask_json(
+    question: str,
+    provider: str = "",
+    papers: list[str] | None = None,
+    live: str = "auto",
+) -> dict:
+    """One answer, with its citations, as data.
+
+    The same engine, the same evidence and the same grounding rules the UI
+    uses — this differs only in returning records instead of markdown, so the
+    two surfaces cannot answer differently.
+    """
+    question = (question or "").strip()
+    if len(question) < 3:
+        return {"error": "Ask a question about the papers."}
+
+    provider = provider or (PROVIDERS[0] if PROVIDERS else "hosted")
+    doc_ids = set(papers) if papers else None
+    want_live = {"auto": None, "always": True, "never": False}.get(live)
+
+    try:
+        evidence, retrieval_ms = asyncio.run(
+            ENGINE.evidence_for(question, live=want_live, doc_ids=doc_ids)
+        )
+    except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
+        return {"error": f"Retrieval failed: {e}"}
+
+    if not evidence:
+        return {
+            "text": NO_EVIDENCE, "citations": [], "model": "",
+            "retrieval_ms": round(retrieval_ms, 1), "generation_ms": 0.0,
+            "passages": 0, "papers": 0,
+        }
+
+    started = time.perf_counter()
+    try:
+        if provider == "gpu":
+            raw = "".join(_stream_from_gpu(question, evidence, None))
+        else:
+            raw = "".join(_sync_stream(question, evidence, None, provider))
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"The model did not answer: {e}"}
+    generation_ms = (time.perf_counter() - started) * 1000.0
+
+    text, citations = resolve(raw, evidence)
+    if not is_grounded(text, citations):
+        text, citations = NO_EVIDENCE, []
+
+    return {
+        "text": text,
+        "citations": [
+            {
+                "marker": c.marker,
+                "chunk_id": c.chunk_id,
+                "doc_title": c.doc_title,
+                "section_heading": c.section_heading,
+                "pages": c.pages,
+                "quote": c.quote,
+                "live": is_live(c.chunk_id),
+            }
+            for c in citations
+        ],
+        "model": GPU_MODEL if provider == "gpu" else ENGINE.provider(provider).model,
+        "retrieval_ms": round(retrieval_ms, 1),
+        "generation_ms": round(generation_ms, 1),
+        "passages": len(evidence),
+        "papers": len({r.chunk.doc_id for r in evidence}),
+    }
+
+
 # On ZeroGPU the attached GPU is the best option and needs no key, so it leads.
 # Anything else the instance has configured follows it.
 PROVIDERS = (["gpu"] if ON_ZERO_GPU else []) + [
@@ -531,6 +612,20 @@ Runs locally with no API key —
         editable=True,
         save_history=False,
     )
+
+    # A JSON endpoint beside the UI, for asifuddin.com to render in its own
+    # design. The page had been embedding this Space in an iframe, which meant
+    # a reader met two visual languages at once — the site's, then Gradio's
+    # inside a box in the middle of it. Handing over structured citations lets
+    # the page draw the answer the way it draws everything else, and the Space
+    # stays what it is for anyone who visits it directly.
+    #
+    # gr.api rather than a route on demo.app: Gradio builds its FastAPI app
+    # inside launch(), so a route decorated onto demo.app beforehand is
+    # silently discarded — that is how an earlier /health returned 404 while
+    # the app served fine.
+    gr.api(ask_json, api_name="ask_json")
+    gr.api(corpus_stats, api_name="corpus_stats")
 
     timing_box.render()
     with gr.Accordion("Evidence", open=True):

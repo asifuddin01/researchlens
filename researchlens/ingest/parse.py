@@ -140,6 +140,19 @@ class _Line:
     bold: bool
     #: Vertical position, used only for ordering within a page.
     top: float
+    #: How large this line reads as display type. `size` is the median, which
+    #: is what heading detection wants; a title set in small caps needs
+    #: something else, because its lines carry different proportions of
+    #: full-size initials — "AN IMAGE IS WORTH 16X16 WORDS:" has a median of
+    #: 17.22 and its own second line 13.77, so they land in separate tiers and
+    #: the title truncates at the colon.
+    #:
+    #: Not the plain maximum, which was tried and regressed two papers badly. A
+    #: drop cap is one 29.4pt glyph on a line of 10pt body text, and taking the
+    #: max promoted the whole body line into the title tier — "USCNet:
+    #: Transformer-Based Multimodal Fusion…" became "is introduced to
+    #: effectively balance the dual objectives U". See `_display_size`.
+    display_size: float = 0.0
 
 
 def _is_bold(fontname: str) -> bool:
@@ -270,6 +283,56 @@ def _order_fragments(
     return out
 
 
+#: Below this horizontal gap, two adjacent fragments were never separated by a
+#: space. `extract_words` starts a new word whenever an extra attribute
+#: changes, so small-caps "AN" arrives as "A" (17.22pt) and "N" (13.77pt) with
+#: 0.8pt between them, while the real space before the next word is 5.1pt.
+#: Same-size words closer than `_X_TOLERANCE` are already merged upstream, so
+#: anything still this close was split by the attribute and not by typography.
+_GLUE_GAP = 2.0
+
+#: How far two baselines may differ and still be one printed line. Wide enough
+#: for the 0.8pt between small caps and their full-size initials; far below the
+#: ~12pt of ordinary line spacing, so no two real lines merge.
+_BASELINE_TOLERANCE = 2.0
+
+
+#: What share of a line's words must be at least as large as a size for the
+#: line to count as being set at it. A small-caps title is 40-50% full-size
+#: initials; a drop cap is one glyph in ten. A quarter separates them with room
+#: on both sides.
+_DISPLAY_SHARE = 0.25
+
+
+def _display_size(sizes: list[float]) -> float:
+    """The size this line reads as, ignoring a lone outsized glyph.
+
+    The largest size that at least `_DISPLAY_SHARE` of the line's words reach.
+    On the two lines of a small-caps title that is 17.22 for both, though their
+    medians are 17.22 and 13.77; on a body line carrying a drop cap it is the
+    body size, because one glyph in ten does not make a line display type.
+    """
+    if not sizes:
+        return 0.0
+    ordered = sorted(sizes, reverse=True)
+    return round(ordered[int(len(ordered) * _DISPLAY_SHARE)], 2)
+
+
+def _join_words(words: list[dict]) -> str:
+    """Join a line's words, re-fusing the ones a font change split apart."""
+    if not words:
+        return ""
+    out = [words[0]["text"]]
+    for prev, w in zip(words, words[1:]):
+        gap = w["x0"] - prev["x1"]
+        same_size = abs(w.get("size", 0.0) - prev.get("size", 0.0)) < 0.01
+        if gap < _GLUE_GAP and not same_size:
+            out[-1] += w["text"]
+        else:
+            out.append(w["text"])
+    return " ".join(out).strip()
+
+
 def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
     """Group words into visual lines, respecting columns and margin boxes.
 
@@ -286,13 +349,21 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
     """
     try:
         words = page.extract_words(
-            extra_attrs=["size", "fontname"],
+            extra_attrs=["size", "fontname", "upright"],
             use_text_flow=False,
             x_tolerance=_X_TOLERANCE,
         )
     except Exception:
         # A page that is a scanned image, or otherwise has no text layer.
         return []
+
+    # Rotated text is marginalia, never body: the arXiv stamp printed sideways
+    # up the left edge, a copyright notice on the spine. pdfplumber reports its
+    # glyphs at one x and a spread of tops, so they scatter into whatever lines
+    # they land near — which is how seven paper titles ended in "A V X", single
+    # letters of "arXiv:2103.14030v2 [cs.CV]" swept into the title because
+    # their 14.44pt rounded within tolerance of the title's 14.35.
+    words = [w for w in words if w.get("upright", True)]
 
     # Drop superscript citation markers before anything else sees them.
     sizes = sorted(w.get("size", 0.0) for w in words if w.get("size"))
@@ -307,10 +378,32 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
             )
         ]
 
+    # Bucketed on the *baseline*, not the top. Small-caps display type — ICLR
+    # and NeurIPS titles, most obviously — sets each word's first letter at
+    # full size and the rest at small-cap size. Those sit on one printed line
+    # and a reader sees one line, but their tops differ by more than the
+    # tolerance: in "AN IMAGE IS WORTH 16X16 WORDS", the capitals are 17.22pt
+    # at top 80.1 and the small caps 13.77pt at top 82.8. Bucketing on top
+    # split them into a tier of initials ("A I", "W", ":") that fails every
+    # title test, and a tier of remainders that passes — so the title extracted
+    # as "N MAGE IS ORTH X ORDS", every word beheaded.
+    #
+    # Bottoms differ by 0.8pt for the same words, because that is what sharing
+    # a baseline means. Same-size text buckets identically either way, so this
+    # changes nothing except the mixed-size lines it exists to fix.
+    # Clustered by gap rather than rounded to a grid. A rounding key always has
+    # a boundary artifact, and this one landed exactly on the case being fixed:
+    # bottoms of 96.5 and 97.3 are 0.8pt apart and round to different halves,
+    # so the small caps stayed split however the key was scaled.
     buckets: dict[float, list[dict]] = {}
-    for w in words:
-        key = round(w["top"] * 2) / 2
-        buckets.setdefault(key, []).append(w)
+    current: list[dict] = []
+    for w in sorted(words, key=lambda w: w["bottom"]):
+        if current and w["bottom"] - current[-1]["bottom"] > _BASELINE_TOLERANCE:
+            buckets[current[0]["bottom"]] = current
+            current = []
+        current.append(w)
+    if current:
+        buckets[current[0]["bottom"]] = current
 
     # Columns are decided once for the page, then applied to every line. A
     # per-line gap threshold cannot do this: justified word spacing and a
@@ -319,12 +412,12 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
 
     # (x0, x1, top, words) for each horizontal run of words.
     fragments: list[tuple[float, float, float, list[dict]]] = []
-    for top in sorted(buckets):
-        bands = [buckets[top]]
+    for base in sorted(buckets):
+        bands = [buckets[base]]
         if split is not None:
-            left = [w for w in buckets[top] if w["x1"] <= split]
-            right = [w for w in buckets[top] if w["x0"] >= split]
-            spanning = [w for w in buckets[top] if w["x0"] < split < w["x1"]]
+            left = [w for w in buckets[base] if w["x1"] <= split]
+            right = [w for w in buckets[base] if w["x0"] >= split]
+            spanning = [w for w in buckets[base] if w["x0"] < split < w["x1"]]
             # A word straddling the gutter means this band is a full-width
             # element; leave it whole so `_order_fragments` treats it as a
             # separator rather than splitting a word's line in half.
@@ -334,13 +427,13 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
             # Within a column, a wide gap still separates a margin box or a
             # table cell from the body beside it.
             for group in _split_on_gutters(band):
-                fragments.append((group[0]["x0"], group[-1]["x1"], top, group))
+                fragments.append((group[0]["x0"], group[-1]["x1"], base, group))
 
     ordered = _order_fragments(fragments, split)
 
     lines: list[_Line] = []
-    for _x0, _x1, top, ws in ordered:
-        text = " ".join(w["text"] for w in ws).strip()
+    for _x0, _x1, base, ws in ordered:
+        text = _join_words(ws)
         if not text:
             continue
         sizes = [w.get("size", 0.0) for w in ws if w.get("size")]
@@ -351,7 +444,8 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
                 page=page_no,
                 size=round(statistics.median(sizes), 2) if sizes else 0.0,
                 bold=sum(_is_bold(f) for f in fonts) > len(fonts) / 2,
-                top=top,
+                top=base,
+                display_size=_display_size(sizes),
             )
         )
     return lines
@@ -420,6 +514,29 @@ _TITLE_BANNER = re.compile(
 )
 
 
+#: A journal masthead, which Elsevier and others set *larger* than the title it
+#: sits above — "Alexandria Engineering Journal" at 13.9pt over the paper's own
+#: title at 13.4. Half a point was enough to win the tier and put the journal's
+#: name on every citation of that paper.
+#:
+#: Bounded by length rather than by vocabulary alone, because a real title may
+#: legitimately contain any of these words: "A Review of Diabetic Retinopathy
+#: Datasets, Approaches, Evaluation Metrics and Future Trends" is a paper in
+#: this very corpus. A masthead is short; that title is not. `review`,
+#: `letters` and `access` are deliberately absent from the list — they are the
+#: words most likely to open a genuine title.
+_VENUE_MASTHEAD = re.compile(
+    r"^[\w&.,'\u2019\- ]{0,44}\b("
+    r"journal|transactions|proceedings|annals|bulletin|acta|"
+    r"scientific\s+reports|results\s+in|advances\s+in|frontiers\s+in"
+    r")\b[\w&.,'\u2019\- ]{0,20}$",
+    re.I,
+)
+
+#: Longest a candidate may be and still be dismissed as a masthead.
+_MASTHEAD_MAX = 45
+
+
 def _plausible_title(text: str) -> bool:
     """Whether a candidate string could be a paper's title.
 
@@ -432,7 +549,10 @@ def _plausible_title(text: str) -> bool:
     words = text.split()
     if len(words) < 2 or len(text) < 15:
         return False
-    if _TITLE_BANNER.match(text.strip()):
+    stripped = text.strip()
+    if _TITLE_BANNER.match(stripped):
+        return False
+    if len(stripped) <= _MASTHEAD_MAX and _VENUE_MASTHEAD.match(stripped):
         return False
     # Letter-spaced display type extracts as "d e e e e e p o n n p e" and
     # "V D C N L -S I R" — plausible by every other measure, and meaningless.
@@ -455,11 +575,11 @@ def _extract_title(lines: list[_Line]) -> str:
     if not first:
         return "Untitled"
 
-    for size in sorted({round(ln.size, 1) for ln in first}, reverse=True):
+    for size in sorted({round(ln.display_size, 1) for ln in first}, reverse=True):
         parts = [
             ln.text
             for ln in first
-            if abs(round(ln.size, 1) - size) < 0.15
+            if abs(round(ln.display_size, 1) - size) < 0.15
             and not re.match(r"^arxiv:", ln.text, re.I)
             and not _FURNITURE.match(ln.text)
         ]
