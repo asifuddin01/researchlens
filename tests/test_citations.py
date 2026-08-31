@@ -117,3 +117,48 @@ def test_no_evidence_never_reaches_the_model():
     import pytest
     with pytest.raises(ValueError, match="no evidence"):
         build_prompt("anything", [])
+
+
+# --- live evidence ----------------------------------------------------------
+
+from researchlens.generate.prompt import build_context  # noqa: E402
+from researchlens.live.arxiv import LivePaper, is_live, to_chunks  # noqa: E402
+
+
+def _live_ev():
+    papers = [LivePaper(
+        paper_id="2608.28444v1", title="Sliding-window beats linear attention",
+        authors=["A. Author"], abstract="We show that sliding-window attention...",
+        published="2026-08-28", url="https://arxiv.org/abs/2608.28444v1",
+    )]
+    return [Retrieved(chunk=c, score=0.0) for c in to_chunks(papers)]
+
+
+def test_a_live_result_is_identifiable_from_its_id():
+    ev = _live_ev()
+    assert is_live(ev[0].chunk.chunk_id)
+    assert not is_live("93b9a09b1d7d2c9e:5")
+
+
+def test_a_live_result_has_no_page_number():
+    """Printing "p0" would invite a reader to look for a page that does not
+    exist; an abstract has no page."""
+    assert _live_ev()[0].chunk.pages == "abstract"
+
+
+def test_the_prompt_marks_live_evidence_as_abstract_only():
+    """Without this the model writes "the paper reports X on dataset Y" from an
+    abstract that never said so."""
+    ctx = build_context(_live_ev())
+    assert "ABSTRACT ONLY" in ctx
+    assert "2026-08-28" in ctx
+
+
+def test_corpus_passages_are_not_marked_abstract_only():
+    assert "ABSTRACT ONLY" not in build_context(EV)
+
+
+def test_a_live_citation_names_its_source_and_date():
+    _text, cites = resolve("Recent work shows this [1].", _live_ev())
+    assert "arXiv 2608.28444v1" in cites[0].section_heading
+    assert cites[0].pages == "abstract"

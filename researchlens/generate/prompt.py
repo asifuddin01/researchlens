@@ -29,6 +29,10 @@ Rules:
 - Do not add background knowledge, even if you are confident it is correct.
 - Quote exact numbers, dataset names and model names as they appear.
 - Be concise. Three or four sentences is usually enough.
+- A passage marked (ABSTRACT ONLY) is a paper's abstract from a live search,
+  not its full text. It supports what that paper claims or sets out to do. It
+  does not support a statement about what was measured, on which dataset, or
+  with what result, because the abstract may not say and a reader cannot check.
 
 If the question asks what is *current*, *recent*, *trending*, or what a field
 is doing now, you are being asked something a fixed set of papers cannot fully
@@ -56,7 +60,14 @@ def build_context(evidence: list[Retrieved], max_chars: int = 9000) -> str:
     used = 0
     for i, r in enumerate(evidence, start=1):
         c = r.chunk
-        block = f"[{i}] {c.doc_title} — {c.section_heading}, p{c.pages}\n{c.text}\n"
+        # Live results are abstracts fetched from a search API, not passages
+        # from an indexed paper. Marking them keeps the model from writing
+        # "the paper reports X on dataset Y" when the abstract never said so —
+        # an abstract supports what a paper *claims*, not what it measured.
+        kind = "ABSTRACT ONLY" if c.chunk_id.startswith("arxiv:") else "passage"
+        block = (
+            f"[{i}] ({kind}) {c.doc_title} — {c.section_heading}, p{c.pages}\n{c.text}\n"
+        )
         if used + len(block) > max_chars and parts:
             break
         parts.append(block)

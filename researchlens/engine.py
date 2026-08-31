@@ -16,7 +16,7 @@ from pathlib import Path
 
 from researchlens.config import Settings
 from researchlens.generate.citations import is_grounded, resolve
-from researchlens.generate.prompt import NO_EVIDENCE
+from researchlens.generate.prompt import NO_EVIDENCE, asks_for_a_survey
 from researchlens.generate.provider import GenerationRequest
 from researchlens.ingest.chunk import chunk_corpus
 from researchlens.ingest.library import load_library
@@ -28,6 +28,12 @@ from researchlens.types import Answer, Chunk, Document, Retrieved
 
 #: What the API serves. The ablation may yet show the reranker earns nothing on
 #: this corpus; if so this becomes `hybrid (RRF)` and the change is one line.
+#: Distinct papers below which a survey question is answered from live search
+#: as well as the corpus. Four, matching the survey floor in the benchmark
+#: builder: one paper is an anecdote, and a "current trends" answer drawn from
+#: three papers is a reading list rather than a trend.
+LIVE_SUPPORT_FLOOR = 4
+
 SERVING = RetrievalConfig(
     label="hybrid + rerank", use_dense=True, use_bm25=True, use_rerank=True,
     candidates=30, top_k=8,
@@ -109,7 +115,43 @@ class Engine:
         )
         return self.pipeline.timed_search(question, config)
 
-    async def ask(self, question: str, provider_name: str = "local", history=None) -> Answer:
+    async def live_evidence(self, question: str, max_results: int = 6) -> list[Retrieved]:
+        """Fetch recent papers when the corpus cannot speak to the question.
+
+        Returned as `Retrieved` so the rest of the pipeline is unchanged; the
+        chunks carry an `arxiv:` id and an "abstract" page, so a reader is
+        never shown an abstract as though it were a passage from a full paper.
+        """
+        from researchlens.live import arxiv
+
+        try:
+            papers = await arxiv.search(question, max_results=max_results)
+        except Exception:
+            # Live search is an enhancement, not a dependency. A network
+            # failure must degrade to a corpus-only answer, never to an error:
+            # the local deployment is supposed to work with no network at all.
+            return []
+        return [Retrieved(chunk=c, score=0.0, sources=frozenset({"live"}))
+                for c in arxiv.to_chunks(papers)]
+
+    def corpus_support(self, question: str, threshold: float = 0.62) -> int:
+        """How many distinct papers the corpus offers on this question.
+
+        Used to decide whether live search is warranted. Deliberately a count
+        of *papers*, not passages: eight passages from one paper is one paper's
+        worth of evidence, and answering "what is the field doing" from it
+        would be the same failure in a new costume.
+        """
+        hits, _ms = self.retrieve(question, top_k=20)
+        return len({r.chunk.doc_id for r in hits if r.score >= threshold})
+
+    async def ask(
+        self,
+        question: str,
+        provider_name: str = "local",
+        history=None,
+        live: bool | None = None,
+    ) -> Answer:
         """Retrieve, generate, then check what came back.
 
         The order matters. Retrieval happens first and, when it returns
@@ -119,6 +161,23 @@ class Engine:
         """
         evidence, retrieval_ms = self.retrieve(question)
         provider = self.provider(provider_name)
+
+        # Whether to reach outside the corpus is decided from what the corpus
+        # actually holds, not from a flag someone has to remember to set. A
+        # question asking what a field is doing *now*, answered from a fixed
+        # corpus, is the failure that looks most like success — real citations,
+        # eight-year-old evidence, no indication of either.
+        if live is None:
+            live = asks_for_a_survey(question) and len(
+                {r.chunk.doc_id for r in evidence}
+            ) < LIVE_SUPPORT_FLOOR
+
+        if live:
+            fetched = await self.live_evidence(question)
+            # Live evidence goes first: for a question about what is recent,
+            # a 2026 abstract is better evidence than a 2017 passage, and the
+            # model cites the passages it reads first more reliably.
+            evidence = fetched + evidence[: max(0, SERVING.top_k - len(fetched))]
 
         if not evidence:
             return Answer(

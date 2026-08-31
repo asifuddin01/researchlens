@@ -43,6 +43,32 @@ delta instead of an intuition.
 **Gate:** no claim in an answer lacks a resolvable passage, and citation
 accuracy is a measured number.
 
+## V — Beyond the corpus (added after Benchmark B)
+
+Benchmark B asks what a field is doing *now*. A fixed corpus cannot answer
+that however good its retrieval, and the failure is the dangerous kind: asked
+for current trends in large language models, the system answered from Attention
+Is All You Need (2017) and BERT (2018) with real citations and no sign the
+evidence was eight years old.
+
+- [x] `live/arxiv.py` — search by submission date, not relevance; arXiv's
+      relevance ordering happily returns the seminal 2017 paper first, which is
+      the exact failure being fixed
+- [x] Live results adapted into `Chunk`, so fusion, prompting and citation
+      resolution work unchanged, with the honesty carried in the fields:
+      `pages` reads "abstract", the heading names the arXiv id and date
+- [x] The prompt marks live passages ABSTRACT ONLY — an abstract supports what
+      a paper *claims*, not what it measured, on which dataset, with what result
+- [x] The decision to go live is made from measured corpus support, counted in
+      distinct papers rather than passages: eight passages from one paper is
+      one paper's worth of evidence
+- [ ] Semantic Scholar, for the journal-only literature arXiv misses — most
+      clinical and much biological work
+- [ ] Cache live results, so a repeated question does not re-fetch
+
+**Gate:** a question with no corpus support returns recent, dated, correctly
+labelled evidence — or declines, and never answers from model memory.
+
 ## IV — Both deployments
 
 - [ ] `docker compose up` on a clean machine, no key, no manual steps
