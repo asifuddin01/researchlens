@@ -78,7 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     async def health():
         providers = []
-        for name in ("local", "hosted"):
+        for name in settings.providers:
             try:
                 p = engine.provider(name)
             except ValueError:

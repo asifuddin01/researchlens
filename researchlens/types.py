@@ -28,6 +28,13 @@ SectionKind = Literal[
     "conclusion",
     "references",
     "appendix",
+    # A figure or table caption, kept as its own passage rather than mixed into
+    # the prose around it. "Fig. 1 | Double perturbation prediction. a,
+    # Beeswarm plot of the prediction errors..." describes what a figure shows,
+    # and is often the only text form of a result that otherwise exists as
+    # pixels. Absorbed into a body passage it is neither findable nor citable.
+    "figure",
+    "table",
     "other",
 ]
 

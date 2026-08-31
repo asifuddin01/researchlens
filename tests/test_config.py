@@ -62,3 +62,15 @@ def test_allowed_origins_can_be_set_from_the_environment():
         os.environ, {"ALLOWED_ORIGINS": "https://a.example, https://b.example"}, clear=True
     ):
         assert Settings.from_env().allowed_origins == ("https://a.example", "https://b.example")
+
+
+def test_providers_default_to_both():
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert Settings.from_env().providers == ("local", "hosted")
+
+
+def test_an_instance_can_offer_only_hosted():
+    """A Space has no persistent volume and therefore no local model. Offering
+    one would put a choice on the page that can never answer."""
+    with mock.patch.dict(os.environ, {"PROVIDERS": "hosted"}, clear=True):
+        assert Settings.from_env().providers == ("hosted",)

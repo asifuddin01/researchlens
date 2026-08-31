@@ -31,6 +31,12 @@ DEFAULT_RERANKER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "qwen2.5:3b-instruct"
 DEFAULT_HOSTED_MODEL = "claude-sonnet-5"
+# Which providers an instance offers. Both, normally. A deployment that has no
+# local model — a Hugging Face Space, where there is no persistent volume to
+# hold one — sets this to "hosted" so the page does not present a choice that
+# can never answer.
+DEFAULT_PROVIDERS = ("local", "hosted")
+
 DEFAULT_ALLOWED_ORIGINS = (
     "http://localhost:3000",
     "http://localhost:4321",
@@ -62,6 +68,7 @@ class Settings:
     #: visitor's browser. Localhost is included so the local build works with
     #: no configuration at all.
     allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
+    providers: tuple[str, ...] = DEFAULT_PROVIDERS
 
     @property
     def uploads_enabled(self) -> bool:
@@ -90,5 +97,10 @@ class Settings:
                 tuple(o.strip() for o in origins.split(",") if o.strip())
                 if (origins := os.getenv("ALLOWED_ORIGINS", ""))
                 else DEFAULT_ALLOWED_ORIGINS
+            ),
+            providers=(
+                tuple(p.strip() for p in provs.split(",") if p.strip())
+                if (provs := os.getenv("PROVIDERS", ""))
+                else DEFAULT_PROVIDERS
             ),
         )

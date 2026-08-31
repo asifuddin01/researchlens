@@ -1,7 +1,92 @@
 # Deploying the public demo
 
+Two routes are prepared. **Hugging Face Spaces** is the one to use: free, no
+card, and 2 vCPU / 16 GB on the free CPU tier — more memory than the Fly plan
+below. Fly is kept because it is better on latency and is the right answer if
+the demo ever matters enough to pay for.
+
+---
+
+# Route A · Hugging Face Spaces
+
+## What differs from local, and why
+
+Generation goes to a hosted OpenAI-compatible endpoint rather than Ollama. A
+free Space has no persistent volume, so a local model would re-download two
+gigabytes on every cold start — a minute of waiting, repeated, for a model
+weaker than the hosted one. Locally the local model stays the default, where it
+is the entire point; on a Space it would be theatre.
+
+Conveniently this needs no new code: Hugging Face's Inference Providers speak
+the OpenAI protocol, so the existing hosted provider works with a base URL and
+a token.
+
+## Build the bundle first
+
+```bash
+python scripts/export_bundle.py --open-access-only
+```
+
+A bundle is extracted full text. **Read the list it prints before publishing** —
+a private image built from subscription journals is one thing, a public Space
+is another.
+
+## you · create the Space
+
+At <https://huggingface.co/new-space>: name `researchlens`, SDK **Docker**,
+hardware **CPU basic (free)**, visibility public.
+
+Then, in Settings → Variables and secrets, add a secret:
+
+| name | value |
+|---|---|
+| `HOSTED_API_KEY` | a token from <https://huggingface.co/settings/tokens> with **Inference** permission |
+
+The token is a Space secret, so it stays server-side — the page never sees it.
+Without it the Space still starts and serves `/search`, and `/ask` reports that
+no provider is configured.
+
+## Push
+
+```bash
+git clone https://huggingface.co/spaces/<your-username>/researchlens ~/hf/researchlens
+./deploy/hf/sync.sh ~/hf/researchlens
+cd ~/hf/researchlens && git add -A && git commit -m "ResearchLens" && git push
+```
+
+The first build takes several minutes; watch it in the Space's **Logs** tab.
+
+## Point the page at it
+
+```bash
+PUBLIC_RESEARCHLENS_API=https://<your-username>-researchlens.hf.space npm run build
+```
+
+Set that in the portfolio repo and deploy as usual. The page probes it first and
+still falls back to localhost, so a reader running the container locally gets
+their own instance instead.
+
+## What to expect
+
+- **Cold start.** A sleeping Space wakes in roughly half a minute, then loads
+  two ONNX models. The first question after a quiet period is slow; the rest
+  are not.
+- **No rate limiting.** The Cloudflare Worker below is Fly-shaped. On a Space
+  the free hardware is itself the limit, and the HF token has its own quota.
+- **Sleeps after inactivity.** Expected, and the page's wake state covers it.
+
+---
+
+
+
 Everything here is prepared and tested except the steps that need your
 credentials. Those are marked **you**.
+
+# Route B · Fly.io
+
+Better latency and a real volume for a local model, at a couple of dollars a
+month. Requires a payment method on the Fly account, which is verification
+against abuse rather than a charge.
 
 The shape: two Fly machines and a Cloudflare Worker.
 

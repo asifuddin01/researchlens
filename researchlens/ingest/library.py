@@ -28,7 +28,7 @@ from researchlens.types import Document, Section
 #: Bumped whenever the parser changes in a way that alters its output. Entries
 #: written under an older version are ignored rather than trusted — a cache that
 #: survives a parser fix would quietly evaluate the old behaviour.
-PARSER_VERSION = 8
+PARSER_VERSION = 9
 
 
 def _pdf_key(path: Path) -> str:

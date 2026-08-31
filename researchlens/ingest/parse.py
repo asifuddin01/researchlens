@@ -93,6 +93,15 @@ _MARKER = re.compile(r"^[0-9]{1,3}(?:[,\u2013-][0-9]{1,3})*$")
 # exact numbers are precisely what lexical retrieval exists to find.
 _MARKER_SIZE_RATIO = 0.82
 
+# The opening of a figure or table caption. Journals punctuate these in every
+# conceivable way — "Fig. 1 |", "Figure 2.", "Table 3:", "Extended Data Fig. 4"
+# — so the separator is optional and the number is what anchors it.
+_CAPTION_START = re.compile(
+    r"^\s*(extended\s+data\s+)?(fig(ure)?\.?|table|supplementary\s+(fig(ure)?|table))"
+    r"\s*\.?\s*\d{1,3}\b",
+    re.I,
+)
+
 # Figure panel labels: "a", "a b", "f g h i". Every token a single letter.
 _PANEL_LABELS = re.compile(r"^\s*[a-z]([\s,]+[a-z])*\s*$", re.I)
 
@@ -657,6 +666,20 @@ def parse_pdf(path: str | Path) -> Document:
         # large or bold and would each open a spurious section. So the first
         # page only yields a heading when the text is a *recognised* division
         # name; later pages accept any line that looks like one.
+        # A caption opens its own passage. It is set apart typographically —
+        # larger or bolder than body text — and describes a figure that is
+        # often the only place a result appears. Left in the prose it is
+        # neither findable nor citable; treated as a heading it would swallow
+        # the paragraphs after it.
+        if _CAPTION_START.match(ln.text) and (ln.size >= body - 0.2 or ln.bold):
+            close(last_page)
+            buf = [ln.text]
+            cur_kind = "table" if re.match(r"^\s*table", ln.text, re.I) else "figure"
+            cur_heading = " ".join(ln.text.split()[:8])
+            cur_page = ln.page
+            last_page = ln.page
+            continue
+
         heading = _looks_like_heading(ln, body)
         if ln.page == 1:
             heading = heading and _classify(ln.text) != "other"
