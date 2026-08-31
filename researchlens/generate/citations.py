@@ -16,7 +16,17 @@ import re
 
 from researchlens.types import Citation, Retrieved
 
-_MARKER = re.compile(r"\[(\d{1,2})\]")
+#: One marker, or several inside one bracket. The grouped form is not a
+#: nicety: a stronger model writes "[1, 2, 3, 4, 5, 6, 7]" naturally, and a
+#: pattern that only matched "[n]" left that whole span as literal text
+#: pointing at nothing while six of the seven sources vanished from the
+#: evidence panel. A marker that resolves to no passage is the exact failure
+#: this module exists to prevent, so it has to be parsed before it can be
+#: checked.
+_MARKER = re.compile(r"\[\s*(\d{1,2}(?:\s*[,;]\s*\d{1,2})*)\s*\]")
+
+#: The numbers inside one bracket.
+_NUMBERS = re.compile(r"\d{1,2}")
 
 #: How much of a passage to show as the quote. Long enough to judge whether it
 #: supports the claim, short enough that the evidence panel stays readable.
@@ -32,17 +42,24 @@ def resolve(text: str, evidence: list[Retrieved]) -> tuple[str, list[Citation]]:
     """
     order: list[int] = []
     for m in _MARKER.finditer(text):
-        n = int(m.group(1))
-        if 1 <= n <= len(evidence) and n not in order:
-            order.append(n)
+        for raw in _NUMBERS.findall(m.group(1)):
+            n = int(raw)
+            if 1 <= n <= len(evidence) and n not in order:
+                order.append(n)
 
     renumber = {old: i + 1 for i, old in enumerate(order)}
 
     def rewrite(m: re.Match[str]) -> str:
-        n = int(m.group(1))
-        # A marker outside the evidence list is a fabrication; remove it
-        # rather than leave a number pointing at nothing.
-        return f"[{renumber[n]}]" if n in renumber else ""
+        # A number outside the evidence list is a fabrication; remove it rather
+        # than leave one pointing at nothing. A group can be partly invented,
+        # so each is judged on its own and the bracket disappears only if
+        # nothing in it survived.
+        kept = [
+            renumber[n]
+            for n in (int(x) for x in _NUMBERS.findall(m.group(1)))
+            if n in renumber
+        ]
+        return "".join(f"[{k}]" for k in kept)
 
     cleaned = _MARKER.sub(rewrite, text)
     # Removing a marker can leave " ." or a double space behind.

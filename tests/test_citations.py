@@ -162,3 +162,56 @@ def test_a_live_citation_names_its_source_and_date():
     _text, cites = resolve("Recent work shows this [1].", _live_ev())
     assert "arXiv 2608.28444v1" in cites[0].section_heading
     assert cites[0].pages == "abstract"
+
+
+# ---- several sources in one bracket ----------------------------------------
+
+def _ev(n: int):
+    from researchlens.types import Chunk, Retrieved
+
+    return [
+        Retrieved(
+            chunk=Chunk(
+                chunk_id=f"d{i}:0", doc_id=f"d{i}", ordinal=0, text=f"Passage {i}.",
+                section_kind="methods", section_heading="h",
+                page_start=1, page_end=1, doc_title=f"Paper {i}",
+            ),
+            score=1.0,
+        )
+        for i in range(1, n + 1)
+    ]
+
+
+def test_a_grouped_marker_resolves_every_source_in_it():
+    """A stronger model writes "[1, 2, 3]" naturally. A pattern matching only
+    "[n]" left the whole span as literal text pointing at nothing while the
+    other sources vanished from the evidence panel — a marker resolving to no
+    passage, which is the failure this module exists to prevent."""
+    text, cites = resolve("Baselines win [1, 2, 3, 4, 5, 6, 7].", _ev(7))
+    assert len(cites) == 7
+    assert text == "Baselines win [1][2][3][4][5][6][7]."
+
+
+def test_a_semicolon_group_is_read_the_same_way():
+    text, cites = resolve("Mixed [2; 4] and single [1].", _ev(5))
+    assert [c.marker for c in cites] == [1, 2, 3]
+    assert text == "Mixed [1][2] and single [3]."
+
+
+def test_a_partly_invented_group_keeps_only_what_exists():
+    """A group can be part real and part fabricated; each number is judged on
+    its own rather than the bracket surviving or dying whole."""
+    text, cites = resolve("Partly invented [2, 99].", _ev(3))
+    assert len(cites) == 1
+    assert text == "Partly invented [1]."
+
+
+def test_a_wholly_invented_group_leaves_no_bracket():
+    text, cites = resolve("All invented [88, 99].", _ev(3))
+    assert cites == []
+    assert text == "All invented."
+
+
+def test_spacing_inside_a_bracket_does_not_matter():
+    _text, cites = resolve("Spaced [ 1 , 2 ] here.", _ev(2))
+    assert len(cites) == 2

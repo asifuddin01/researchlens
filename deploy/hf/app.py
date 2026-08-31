@@ -281,6 +281,20 @@ def _looks_like_quota(err: Exception) -> bool:
 #: happens; read where it is reported.
 _LAST_WRITER = GPU_MODEL
 
+#: When the GPU allowance was last found to be spent.
+#:
+#: Without this, every question pays to discover it again: the allocation is
+#: requested, the scheduler refuses it, and only then does the fallback start —
+#: measured at 99 s end to end on a question the fallback alone answers in
+#: about thirty. A refusal is not per-question, so asking again inside the
+#: cooldown learns nothing and costs the reader a minute.
+#:
+#: Ten minutes because ZeroGPU refills gradually rather than on a published
+#: schedule. Guessing low costs one wasted attempt; guessing high means using
+#: the fallback while the GPU was already free again.
+_GPU_BLOCKED_UNTIL = 0.0
+_GPU_COOLDOWN = 600.0
+
 
 def _stream_from_gpu(question, evidence, history):
     """Generate on the attached GPU, yielding text as it arrives.
@@ -292,16 +306,25 @@ def _stream_from_gpu(question, evidence, history):
     were actually retrieved, an invented one is removed, and an answer left
     with nothing supported becomes a refusal.
     """
-    global _LAST_WRITER
+    global _LAST_WRITER, _GPU_BLOCKED_UNTIL
 
     system, user = build_prompt(question, evidence, history)
+    provider = _fallback_provider()
+
+    if provider is not None and time.monotonic() < _GPU_BLOCKED_UNTIL:
+        _LAST_WRITER = FALLBACK_MODEL
+        yield from _sync_stream(question, evidence, history, provider=provider)
+        return
+
     _LAST_WRITER = GPU_MODEL
     try:
         yield from _stream_on_gpu(system, user)
         return
     except Exception as e:  # noqa: BLE001
         first = e
-        if not _looks_like_quota(e):
+        if _looks_like_quota(e):
+            _GPU_BLOCKED_UNTIL = time.monotonic() + _GPU_COOLDOWN
+        else:
             # Streaming is presentation. Losing it should cost the reader a
             # progress bar, not an answer.
             print(f"  GPU streaming failed, one call instead: {e}", flush=True)
@@ -312,7 +335,6 @@ def _stream_from_gpu(question, evidence, history):
                 first = e2
 
     # The allocation itself is unavailable, so retrying it is pointless.
-    provider = _fallback_provider()
     if provider is None:
         raise first
     print(f"  GPU unavailable ({first}); writing with {FALLBACK_MODEL}", flush=True)
