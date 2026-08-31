@@ -34,41 +34,52 @@ def test_split_on_gutters_handles_an_empty_band():
     assert _split_on_gutters([]) == []
 
 
-def _frags(n_left, n_right, straddlers=0, width=600.0):
+def _words(n_left, n_right, full_width=0, width=600.0):
+    """Words laid out as columns. `_column_split` measures raw words, because
+    no word ever crosses a gutter — that is the whole basis of the signal."""
     out = []
     for i in range(n_left):
-        out.append((40.0, 280.0, float(i * 12)))
+        # Several words per line, all left of the gutter.
+        for x in (40.0, 100.0, 160.0, 220.0):
+            out.append({"x0": x, "x1": x + 50.0, "top": float(i * 12)})
     for i in range(n_right):
-        out.append((320.0, 560.0, float(i * 12)))
-    for i in range(straddlers):
-        out.append((40.0, 560.0, float(-10 - i)))
+        for x in (320.0, 380.0, 440.0, 500.0):
+            out.append({"x0": x, "x1": x + 50.0, "top": float(i * 12)})
+    for i in range(full_width):
+        # A spanning title: individual words still do not cross the gutter,
+        # they simply appear on both sides of it.
+        for x in (40.0, 160.0, 300.0, 420.0):
+            out.append({"x0": x, "x1": x + 90.0, "top": float(-10 - i)})
     return out
 
 
 def test_two_columns_are_detected():
-    split = _column_split(_frags(10, 10), 600.0)
+    split = _column_split(_words(12, 12), 600.0)
     assert split is not None
-    assert 280 < split < 320
+    assert 270 < split < 330
 
 
 def test_a_full_width_title_does_not_defeat_detection():
-    """The bug this replaced: requiring that nothing straddle the line meant a
-    single title above two columns disabled column ordering for the page, and
-    every real paper has one."""
-    assert _column_split(_frags(10, 10, straddlers=1), 600.0) is not None
+    """The bug this replaced: counting fragments that straddle a candidate line
+    meant any page with a full-width figure looked single-column, and most
+    pages have one."""
+    assert _column_split(_words(12, 12, full_width=3), 600.0) is not None
 
 
 def test_single_column_is_not_split():
-    frags = [(40.0, 560.0, float(i * 12)) for i in range(12)]
-    assert _column_split(frags, 600.0) is None
+    words = []
+    for i in range(20):
+        for x in range(40, 540, 60):
+            words.append({"x0": float(x), "x1": float(x + 55), "top": float(i * 12)})
+    assert _column_split(words, 600.0) is None
 
 
-def test_a_lone_page_number_is_not_a_column():
-    assert _column_split(_frags(20, 1), 600.0) is None
+def test_a_lone_marginal_element_is_not_a_column():
+    assert _column_split(_words(20, 1), 600.0) is None
 
 
-def test_too_few_fragments_to_judge():
-    assert _column_split(_frags(2, 2), 600.0) is None
+def test_too_few_words_to_judge():
+    assert _column_split(_words(2, 2), 600.0) is None
 
 
 def test_columns_are_read_left_then_right():

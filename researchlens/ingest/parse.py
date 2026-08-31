@@ -98,6 +98,11 @@ _X_TOLERANCE = 2.0
 # above any inter-word space at body size, well below a real gutter.
 _GUTTER_GAP = 18.0
 
+# Coverage at the gutter, as a fraction of the page's peak coverage, below
+# which a page is treated as two-column. Measured on this corpus: two-column
+# pages trough at 0.28, single-column at 0.56 and above.
+_GUTTER_RATIO = 0.40
+
 # Below this many characters per page, the file has no usable text layer.
 # See the density check in `parse_pdf` for why this is not `if not lines`.
 _MIN_CHARS_PER_PAGE = 100
@@ -144,38 +149,65 @@ def _split_on_gutters(words: list[dict]) -> list[list[dict]]:
     return groups
 
 
-def _column_split(fragments: list[tuple[float, float, float]], width: float) -> float | None:
-    """Find the x at which this page divides into two text regions, if any.
+def _column_split(words: list[dict], width: float) -> float | None:
+    """Find the page's column gutter from where no word is printed.
 
-    `fragments` are (x0, x1, top). Full-width elements — the title, a spanning
-    figure caption — are expected and are *not* disqualifying: an earlier
-    version required that nothing straddle the candidate line, which meant one
-    title above two columns defeated column detection for the whole page, and
-    every real paper has one.
+    The signal is horizontal coverage computed over *raw words*. A word is a
+    contiguous run of glyphs, so no word ever crosses a gutter, and a
+    two-column page therefore shows a narrow band of near-zero coverage down
+    its middle. A single-column page does not.
 
-    A split is accepted when it divides the page into two well-populated sides
-    with few straddlers. The straddlers are then handled as separators by
-    `_order_fragments`, not discarded.
+    Two earlier attempts failed on real papers and are worth recording so they
+    are not tried again:
+
+    1. Counting fragments that straddle a candidate line. Any page with a
+       full-width figure — which is most pages — looked single-column.
+    2. Coverage computed over merged line-fragments rather than words. The
+       merged fragments already spanned the gutter, which is the very defect
+       being detected, so the measurement destroyed its own signal.
+
+    Splitting on a fixed horizontal gap cannot replace this either: justified
+    body text on these papers reaches 15pt between words while a column gutter
+    can be as narrow as 15pt, so the two ranges overlap and no absolute
+    threshold separates them. Columns are a property of the page, not of a line.
+
+    Measured on this corpus: two-column pages trough at 0.28 of peak coverage,
+    single-column pages at 0.56 and above.
     """
-    if len(fragments) < 6:
+    if len(words) < 40:
         return None
-    best: float | None = None
-    best_score = 0.0
-    for f in (0.40, 0.45, 0.48, 0.50, 0.52, 0.55, 0.60, 0.66, 0.72):
-        x = width * f
-        left = sum(1 for a, b, _ in fragments if b <= x)
-        right = sum(1 for a, b, _ in fragments if a >= x)
-        straddle = len(fragments) - left - right
-        if not left or not right:
-            continue
-        # Too much crossing the line means this is one column of text, not two.
-        if straddle > len(fragments) * 0.25:
-            continue
-        score = min(left, right) / len(fragments)
-        if score > best_score:
-            best, best_score = x, score
-    # Below this, the smaller side is a page number or a stray label.
-    return best if best_score >= 0.06 else None
+
+    bins = 80
+    scale = bins / width
+    coverage = [0] * bins
+    for w in words:
+        lo = max(0, min(bins - 1, int(w["x0"] * scale)))
+        hi = max(0, min(bins - 1, int(w["x1"] * scale)))
+        for i in range(lo, hi + 1):
+            coverage[i] += 1
+
+    peak = max(coverage)
+    if peak == 0:
+        return None
+
+    # Only the middle can hold a gutter: a gap near an edge is a margin.
+    lo_b, hi_b = int(bins * 0.32), int(bins * 0.68)
+    window = coverage[lo_b:hi_b]
+    if not window:
+        return None
+
+    trough = min(window)
+    if trough > peak * _GUTTER_RATIO:
+        return None
+
+    idx = lo_b + window.index(trough)
+    split = (idx + 0.5) / scale
+
+    left = sum(1 for w in words if w["x1"] <= split)
+    right = sum(1 for w in words if w["x0"] >= split)
+    if min(left, right) < len(words) * 0.15:
+        return None
+    return split
 
 
 def _order_fragments(
@@ -245,13 +277,30 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
         key = round(w["top"] * 2) / 2
         buckets.setdefault(key, []).append(w)
 
+    # Columns are decided once for the page, then applied to every line. A
+    # per-line gap threshold cannot do this: justified word spacing and a
+    # narrow gutter occupy the same range of gap widths.
+    split = _column_split(words, float(page.width))
+
     # (x0, x1, top, words) for each horizontal run of words.
     fragments: list[tuple[float, float, float, list[dict]]] = []
     for top in sorted(buckets):
-        for group in _split_on_gutters(buckets[top]):
-            fragments.append((group[0]["x0"], group[-1]["x1"], top, group))
+        bands = [buckets[top]]
+        if split is not None:
+            left = [w for w in buckets[top] if w["x1"] <= split]
+            right = [w for w in buckets[top] if w["x0"] >= split]
+            spanning = [w for w in buckets[top] if w["x0"] < split < w["x1"]]
+            # A word straddling the gutter means this band is a full-width
+            # element; leave it whole so `_order_fragments` treats it as a
+            # separator rather than splitting a word's line in half.
+            if not spanning:
+                bands = [b for b in (left, right) if b]
+        for band in bands:
+            # Within a column, a wide gap still separates a margin box or a
+            # table cell from the body beside it.
+            for group in _split_on_gutters(band):
+                fragments.append((group[0]["x0"], group[-1]["x1"], top, group))
 
-    split = _column_split([(f[0], f[1], f[2]) for f in fragments], float(page.width))
     ordered = _order_fragments(fragments, split)
 
     lines: list[_Line] = []

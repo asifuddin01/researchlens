@@ -30,6 +30,9 @@ test: ## run the unit tests
 lint:
 	$(VENV)/bin/ruff check .
 
+label: ## browse the corpus to write ground truth (ARGS="--papers")
+	$(PY) scripts/label.py $(ARGS)
+
 search: ## query the corpus from the command line (Q="your question")
 	$(PY) scripts/search.py $(Q)
 
