@@ -175,7 +175,12 @@ async def search(
 #: PubMed record was cited as "arxiv:PMID39541441" — a citation lying about
 #: where it came from, which is worse than an uncited claim because it looks
 #: checkable.
-LIVE_PREFIXES = ("arxiv", "pubmed")
+LIVE_PREFIXES = ("arxiv", "pubmed", "openalex")
+
+#: How each source is named in a citation. A reader who sees "OpenAlex" learns
+#: nothing about where the work was published, so the venue travels in the
+#: abstract text instead and this stays the index's name.
+SOURCE_NAMES = {"arxiv": "arXiv", "pubmed": "PubMed", "openalex": "OpenAlex"}
 
 
 def is_live(chunk_id: str) -> bool:
@@ -202,7 +207,7 @@ def to_chunks(papers: list[LivePaper]) -> list[Chunk]:
                 text=p.abstract,
                 section_kind="abstract",
                 section_heading=(
-                    f"{'arXiv' if p.source == 'arxiv' else 'PubMed'} {p.paper_id}"
+                    f"{SOURCE_NAMES.get(p.source, p.source)} {p.paper_id}"
                     f" · abstract · {p.published}"
                 ),
                 page_start=0,

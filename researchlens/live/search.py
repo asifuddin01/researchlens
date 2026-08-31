@@ -12,17 +12,26 @@ for anyone without a subscription is worse than an absent feature.
             life-science journals. Covers the clinical and biological
             literature arXiv does not, at the cost of appearing months later.
 
-  Semantic  free, keyless at a low rate limit. Broad coverage across fields
-  Scholar   with citation counts. Not yet wired up; the next one to add.
+  OpenAlex  free, no key. ~250 million works — the engineering and
+            computer-science *journal* literature the other two miss almost
+            entirely: IEEE, ACM, Elsevier, Springer. Abstracts arrive inverted
+            and are reconstructed; records without one are dropped.
 
   IEEE      needs an API key, institutional or paid.
   Xplore
 
   Scopus    needs an Elsevier key and a subscription.
 
-The last two are deliberately absent rather than forgotten. They can be added
-behind configuration for anyone who has a key, in the same way the hosted
-generation provider is optional — but neither can be a default.
+The last two are deliberately absent rather than forgotten, and OpenAlex is
+most of the answer to why: Xplore's own API is gated, but its records are in
+OpenAlex, so the coverage arrives without the key. What does not arrive is
+Xplore's full text — no keyless source offers that, which is why live evidence
+is labelled abstract-level everywhere it appears.
+
+Semantic Scholar is the other obvious candidate and is deliberately not here.
+Keyless access is rate-limited hard enough that 429 is the common response, and
+a source that fails most of the time is worse than an absent one — it makes
+live search look broken rather than incomplete.
 
 Sources are queried concurrently, because two sequential HTTP round trips is
 the difference between a question that feels answered and one that feels hung.
@@ -32,13 +41,14 @@ from __future__ import annotations
 
 import asyncio
 
-from researchlens.live import arxiv, pubmed
+from researchlens.live import arxiv, openalex, pubmed
 from researchlens.live.arxiv import LivePaper
 
 #: Source name -> its async search function. Adding a source is adding a row.
 SOURCES = {
     "arxiv": arxiv.search,
     "pubmed": pubmed.search,
+    "openalex": openalex.search,
 }
 
 

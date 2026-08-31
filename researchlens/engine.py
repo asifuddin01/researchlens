@@ -300,7 +300,7 @@ class Engine:
             per_doc = max(2, -(-slots // max(docs, 1)))
         return self._merge_reserved(question, uploaded, corpus, slots, per_doc, 2, k)
 
-    async def live_evidence(self, question: str, max_results: int = 6) -> list[Retrieved]:
+    async def live_evidence(self, question: str, max_results: int = 9) -> list[Retrieved]:
         """Fetch recent papers when the corpus cannot speak to the question.
 
         Returned as `Retrieved` so the rest of the pipeline is unchanged; the
@@ -310,7 +310,13 @@ class Engine:
         from researchlens.live import arxiv, search as live_search
 
         try:
-            papers = await live_search.search(question, per_source=max_results // 2 or 3)
+            # Divided by the number of sources, not hard-coded: adding a
+            # source used to mean silently asking for half again as much
+            # evidence, because the divisor said "two" while `SOURCES` said
+            # three. The merge interleaves, so an even split is what makes
+            # every index visible in the answer.
+            per = max(2, max_results // max(len(live_search.SOURCES), 1))
+            papers = await live_search.search(question, per_source=per)
         except Exception as e:
             # Live search is an enhancement, not a dependency: a network
             # failure degrades to a corpus-only answer rather than an error,

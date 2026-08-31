@@ -109,3 +109,57 @@ def test_one_source_failing_does_not_lose_the_other():
 
 def test_no_known_source_returns_nothing_rather_than_raising():
     assert asyncio.run(search.search("q", sources=["scopus"])) == []
+
+
+# ---- OpenAlex --------------------------------------------------------------
+
+def test_an_inverted_abstract_is_rebuilt_in_order():
+    from researchlens.live.openalex import reconstruct_abstract
+
+    inverted = {"Federated": [0], "learning": [1, 5], "enables": [2],
+                "private": [3], "collaborative": [4], ".": [6]}
+    assert reconstruct_abstract(inverted) == (
+        "Federated learning enables private collaborative learning ."
+    )
+
+
+def test_a_missing_inverted_abstract_is_empty_not_an_error():
+    from researchlens.live.openalex import reconstruct_abstract
+
+    assert reconstruct_abstract(None) == ""
+    assert reconstruct_abstract({}) == ""
+
+
+def test_openalex_keeps_more_terms_than_pubmed():
+    """OpenAlex ranks a full-text match, so extra terms reorder rather than
+    narrow to nothing — the opposite of PubMed's boolean AND."""
+    from researchlens.live import openalex, pubmed
+
+    q = "What are the current trends in federated learning for medical imaging?"
+    assert openalex.build_query(q) == "federated learning medical imaging"
+    assert " AND " in pubmed.build_query(q)
+
+
+def test_every_live_source_has_a_display_name():
+    """A citation heading is built from this map; a source missing from it
+    would be cited by its internal key."""
+    from researchlens.live.arxiv import LIVE_PREFIXES, SOURCE_NAMES
+    from researchlens.live.search import SOURCES
+
+    assert set(SOURCES) <= set(LIVE_PREFIXES)
+    assert set(SOURCES) <= set(SOURCE_NAMES)
+
+
+def test_a_live_chunk_names_its_index_and_cannot_pass_as_a_page():
+    from researchlens.live.arxiv import LivePaper, is_live, to_chunks
+
+    chunks = to_chunks([
+        LivePaper(paper_id="10.1109/TMI.2024.1", title="A Journal Paper",
+                  authors=["R Lee"], abstract="[IEEE TMI] We measured things.",
+                  published="2024-10-18", url="https://doi.org/x",
+                  source="openalex"),
+    ])
+    c = chunks[0]
+    assert is_live(c.chunk_id)
+    assert c.pages == "abstract"
+    assert "OpenAlex" in c.section_heading
