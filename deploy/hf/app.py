@@ -22,9 +22,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import warnings
+from pathlib import Path
 
 warnings.filterwarnings("ignore")
+
+# On a Space this file sits at the repository root beside `researchlens/`, so
+# the import works unaided. Run from `deploy/hf/` during development it does
+# not, and a file that only runs where it is deployed cannot be tested before
+# it is deployed.
+for candidate in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[2]):
+    if (candidate / "researchlens").is_dir():
+        sys.path.insert(0, str(candidate))
+        break
 
 import gradio as gr  # noqa: E402
 
@@ -102,6 +113,10 @@ This is a read-only exhibit of a system that runs locally with no API key —
         question = gr.Textbox(
             label="Your question",
             placeholder="What does the literature say about…",
+            # Without an explicit height a Textbox expands to fill its row,
+            # which left a question box taller than the answer beneath it.
+            lines=2,
+            max_lines=4,
             scale=5,
         )
         provider = gr.Radio(
@@ -114,7 +129,11 @@ This is a read-only exhibit of a system that runs locally with no API key —
 
     answer_box = gr.Markdown(label="Answer")
     timing_box = gr.Markdown()
-    evidence_box = gr.Markdown()
+    # Collapsed by default. The evidence is the point, but it is long, and a
+    # reader who wants the answer should not have to scroll past five quoted
+    # passages to find out whether there was one.
+    with gr.Accordion("Evidence", open=True):
+        evidence_box = gr.Markdown()
 
     gr.Examples(examples=[[q] for q in EXAMPLES], inputs=[question])
 
