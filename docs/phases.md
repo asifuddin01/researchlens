@@ -48,7 +48,9 @@ accuracy is a measured number.
 - [ ] `docker compose up` on a clean machine, no key, no manual steps
 - [ ] Fly deploy: retrieval suspended (<2 GB), generation scaling to zero
 - [ ] Cloudflare Worker proxy with a hard daily ceiling
-- [ ] `/researchlens` page and a `projects` entry on asifuddin.com
+- [x] `/researchlens` page and a `projects` entry on asifuddin.com — the page is
+      live and reads its endpoint from `PUBLIC_RESEARCHLENS_API`, so deploying
+      the backend turns the question box on with no code change
 
 **Gate:** a stranger can clone and run it, or click and use it, without reading
 anything first.

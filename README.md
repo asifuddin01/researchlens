@@ -93,10 +93,14 @@ same retrieved evidence.
 
 ## The public demo
 
-<https://asifuddin.com/researchlens> runs the same container in `demo` mode —
-fixed corpus, uploads off, rate-limited at the edge. It is a read-only exhibit,
-not the system: a public deployment cannot honestly claim "your documents never
-leave your machine", so it does not.
+<https://asifuddin.com/researchlens> is the project's page. The hosted instance
+is **not deployed yet**, and the page says so rather than showing a question box
+that cannot answer — it gives the `docker compose up` instructions instead.
+
+When it is deployed it will run this same container in `demo` mode: fixed
+corpus, uploads off, rate-limited at the edge. It will be a read-only exhibit,
+not the system. A public deployment cannot honestly claim "your documents never
+leave your machine", so it will not.
 
 ## Layout
 
