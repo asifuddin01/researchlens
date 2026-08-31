@@ -180,8 +180,15 @@ class DenseRetriever:
 
     # ---- search ----------------------------------------------------------
 
-    def search(self, query: str, k: int) -> list[tuple[str, float]]:
-        """Return the k nearest chunks as `(chunk_id, cosine)`, descending."""
+    def search(
+        self, query: str, k: int, allow: set[int] | None = None
+    ) -> list[tuple[str, float]]:
+        """Return the k nearest chunks as `(chunk_id, cosine)`, descending.
+
+        `allow` holds row indices. Masking the score vector costs one pass and
+        guarantees the subset is represented; filtering afterwards does not,
+        because the top k over the whole corpus may contain none of it.
+        """
         if self._matrix is None:
             raise RuntimeError("search() before index()")
 
@@ -190,6 +197,16 @@ class DenseRetriever:
         vec = vec / (np.linalg.norm(vec) or 1.0)
 
         scores = self._matrix @ vec
+
+        if allow is not None:
+            # -inf rather than 0: a cosine can legitimately be negative, and
+            # zeroing would rank an excluded passage above a poorly-matching
+            # included one.
+            mask = np.full(scores.shape, -np.inf, dtype=scores.dtype)
+            idx = np.fromiter(allow, dtype=np.int64, count=len(allow))
+            mask[idx] = scores[idx]
+            scores = mask
+            k = min(k, len(allow))
 
         k = min(k, len(self._ids))
         if k <= 0:

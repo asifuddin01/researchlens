@@ -84,7 +84,19 @@ class BM25Retriever:
             term: max(0.0, math.log((n - d + 0.5) / (d + 0.5) + 1.0)) for term, d in df.items()
         }
 
-    def search(self, query: str, k: int) -> list[tuple[str, float]]:
+    def search(
+        self, query: str, k: int, allow: set[int] | None = None
+    ) -> list[tuple[str, float]]:
+        """Rank chunks against the query, optionally within a subset.
+
+        `allow` holds row indices, not ids, because this is the inner loop.
+
+        Restricting here rather than filtering the results afterwards is not an
+        optimisation. Filtering after the fact returns nothing when scores tie:
+        the tie-break is alphabetical by id, so a wide pool fills with
+        alphabetically-early papers and the selected one never appears in it. A
+        reader who picked one paper would be told the corpus had nothing.
+        """
         if not self._ids:
             raise RuntimeError("search() before index()")
 
@@ -96,6 +108,8 @@ class BM25Retriever:
             if not idf:
                 continue
             for i, tf in enumerate(self._tf):
+                if allow is not None and i not in allow:
+                    continue
                 f = tf.get(term)
                 if not f:
                     continue

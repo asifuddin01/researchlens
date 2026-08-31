@@ -31,11 +31,15 @@ from researchlens.generate.provider import GenerationRequest
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=500)
     provider: str = Field(default="local", pattern="^(local|hosted)$")
+    #: Restrict the answer to these papers. Empty or absent means the whole
+    #: corpus, which is the common case and should need no argument.
+    doc_ids: list[str] | None = Field(default=None, max_length=200)
 
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=500)
     k: int = Field(default=8, ge=1, le=30)
+    doc_ids: list[str] | None = Field(default=None, max_length=200)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -117,7 +121,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def search(req: SearchRequest):
         """Evidence without an answer. Useful on its own, and the fastest way
         to tell a retrieval problem from a generation one."""
-        hits, ms = engine.retrieve(req.query, top_k=req.k)
+        hits, ms = engine.retrieve(
+            req.query, top_k=req.k, doc_ids=set(req.doc_ids) if req.doc_ids else None
+        )
         return {
             "query": req.query,
             "retrieval_ms": round(ms, 1),
@@ -138,7 +144,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/ask")
     async def ask(req: AskRequest):
         try:
-            answer = await engine.ask(req.question, req.provider)
+            answer = await engine.ask(
+                req.question,
+                req.provider,
+                doc_ids=set(req.doc_ids) if req.doc_ids else None,
+            )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:
@@ -177,7 +187,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cannot be checked against the evidence until it has been written. The
         text streams; the evidence arrives at the end, in one event.
         """
-        evidence, retrieval_ms = engine.retrieve(req.question)
+        evidence, retrieval_ms = engine.retrieve(
+            req.question, doc_ids=set(req.doc_ids) if req.doc_ids else None
+        )
         try:
             provider = engine.provider(req.provider)
         except ValueError as e:

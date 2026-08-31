@@ -74,16 +74,55 @@ class RetrievalPipeline:
         self.bm25 = bm25
         self.reranker = reranker
         self._by_id: dict[str, Chunk] = {}
+        self._chunks: list[Chunk] = []
 
-    def index(self, chunks: list[Chunk]) -> None:
+    def index(self, chunks: list[Chunk], skip_dense: bool = False) -> None:
+        # The list is kept, not just the map. Row indices passed to the
+        # retrievers are positions in the sequence they indexed, and deriving
+        # them from a dict's insertion order would couple correctness to a
+        # detail that holds today and says nothing about tomorrow. A duplicate
+        # id would silently shift every index after it and retrieve the wrong
+        # passage confidently.
+        self._chunks = list(chunks)
         self._by_id = {c.chunk_id: c for c in chunks}
-        if self.dense is not None:
+        if len(self._by_id) != len(self._chunks):
+            raise ValueError(
+                f"{len(self._chunks) - len(self._by_id)} duplicate chunk ids — "
+                "row indices would no longer match the retrievers"
+            )
+        if self.dense is not None and not skip_dense:
             self.dense.index(chunks)
         if self.bm25 is not None:
             self.bm25.index(chunks)
 
-    def search(self, query: str, config: RetrievalConfig) -> list[Retrieved]:
-        """Run one query under one configuration."""
+    def index_without_dense(self, chunks: list[Chunk]) -> None:
+        """Index everything except the dense vectors.
+
+        For a deployment loading a prebuilt bundle: the embeddings are already
+        computed, and re-embedding 9,870 passages at every container start
+        would make a scale-to-zero demo unusable.
+        """
+        self.index(chunks, skip_dense=True)
+
+    def search(
+        self,
+        query: str,
+        config: RetrievalConfig,
+        doc_ids: set[str] | None = None,
+    ) -> list[Retrieved]:
+        """Run one query under one configuration, optionally within a subset.
+
+        `doc_ids` restricts the answer to chosen papers. Filtering happens
+        after retrieval rather than before, because the BM25 statistics and the
+        dense matrix are built over the whole corpus and rebuilding either per
+        request would cost more than the query.
+
+        That makes the candidate pool the thing to get right: asking two papers
+        out of a hundred, the top thirty results are unlikely to contain thirty
+        passages from those two. The pool therefore widens with how narrow the
+        selection is, so a specific question about a specific paper does not
+        come back empty because the corpus had more to say elsewhere.
+        """
         if config.use_dense and self.dense is None:
             raise RuntimeError(f"{config.label} needs a dense retriever; none was given")
         if config.use_bm25 and self.bm25 is None:
@@ -91,15 +130,19 @@ class RetrievalPipeline:
         if config.use_rerank and self.reranker is None:
             raise RuntimeError(f"{config.label} needs a reranker; none was given")
 
+        allow = self._rows_for(doc_ids)
+        if allow is not None and not allow:
+            return []
+
         rankings: dict[str, list[str]] = {}
         raw: dict[str, dict[str, float]] = {}
 
         if config.use_dense:
-            hits = self.dense.search(query, config.candidates)
+            hits = self.dense.search(query, config.candidates, allow)
             rankings["dense"] = [cid for cid, _ in hits]
             raw["dense"] = dict(hits)
         if config.use_bm25:
-            hits = self.bm25.search(query, config.candidates)
+            hits = self.bm25.search(query, config.candidates, allow)
             rankings["bm25"] = [cid for cid, _ in hits]
             raw["bm25"] = dict(hits)
 
@@ -139,8 +182,20 @@ class RetrievalPipeline:
             for cid, score, srcs in fused[: config.top_k]
         ]
 
+    def _rows_for(self, doc_ids: set[str] | None) -> set[int] | None:
+        """Row indices belonging to the chosen papers.
+
+        Both retrievers index chunks in the order they were given, so one
+        ordering serves both. Computed per call rather than cached: a reader
+        changes the selection far more often than the corpus changes, and the
+        pass is over ids rather than text.
+        """
+        if doc_ids is None:
+            return None
+        return {i for i, c in enumerate(self._chunks) if c.doc_id in doc_ids}
+
     def timed_search(
-        self, query: str, config: RetrievalConfig
+        self, query: str, config: RetrievalConfig, doc_ids: set[str] | None = None
     ) -> tuple[list[Retrieved], float]:
         """Search, returning elapsed milliseconds alongside the results.
 
@@ -150,5 +205,5 @@ class RetrievalPipeline:
         hides which one is on offer.
         """
         start = time.perf_counter()
-        results = self.search(query, config)
+        results = self.search(query, config, doc_ids)
         return results, (time.perf_counter() - start) * 1000.0

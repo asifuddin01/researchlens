@@ -95,3 +95,97 @@ def test_a_term_in_every_document_does_not_push_results_down():
     r = BM25Retriever()
     r.index([_chunk(i, "cells were measured") for i in range(4)])
     assert all(s >= 0 for _, s in r.search("cells measured", k=4))
+
+
+# --- restricting retrieval to chosen papers ---------------------------------
+
+def test_a_subset_returns_only_its_papers():
+    """A reader who selects two papers has said the rest is not what they
+    want, and retrieval must honour that even when the corpus has more to say
+    elsewhere."""
+    from researchlens.retrieval.dense import DenseRetriever
+    from researchlens.retrieval.pipeline import RetrievalConfig, RetrievalPipeline
+
+    def chunk(doc: str, i: int, text: str) -> Chunk:
+        return Chunk(
+            chunk_id=f"{doc}:{i}", doc_id=doc, ordinal=i, text=text,
+            section_kind="results", section_heading="Results",
+            page_start=1, page_end=1, doc_title=f"Paper {doc}",
+        )
+
+    # Distinct text per chunk: identical passages tie, and the deterministic
+    # tie-break then fills the whole top-k from one paper, which would make
+    # this test pass for the wrong reason.
+    chunks = [chunk("a", i, f"kidney segmentation dice score variant a{i}") for i in range(20)]
+    chunks += [chunk("b", i, f"kidney segmentation dice score variant b{i}") for i in range(20)]
+    chunks += [chunk("c", i, f"kidney segmentation dice score variant c{i}") for i in range(20)]
+
+    bm25 = BM25Retriever()
+    pipe = RetrievalPipeline(dense=None, bm25=bm25, reranker=None)
+    pipe.index(chunks)
+
+    cfg = RetrievalConfig("bm25 only", use_dense=False, use_bm25=True,
+                          use_rerank=False, candidates=10, top_k=8)
+
+    # Unrestricted, the corpus is free to answer from anywhere — which paper
+    # wins is not the point and with synthetic near-identical passages it is
+    # decided by the tie-break.
+    assert pipe.search("kidney dice", cfg)
+
+    only_c = pipe.search("kidney dice", cfg, doc_ids={"c"})
+    assert only_c, "a narrow selection must still return results"
+    assert {r.chunk.doc_id for r in only_c} == {"c"}
+
+    two = pipe.search("kidney dice", cfg, doc_ids={"a", "c"})
+    assert {r.chunk.doc_id for r in two} <= {"a", "c"}
+
+
+def test_a_subset_widens_the_candidate_pool():
+    """Filtering after retrieval returns nothing if the pool is not widened:
+    the top ten hits over a hundred papers rarely include ten from the two a
+    reader picked."""
+    from researchlens.retrieval.pipeline import RetrievalConfig, RetrievalPipeline
+
+    def chunk(doc: str, i: int, text: str) -> Chunk:
+        return Chunk(
+            chunk_id=f"{doc}:{i}", doc_id=doc, ordinal=i, text=text,
+            section_kind="results", section_heading="Results",
+            page_start=1, page_end=1, doc_title=f"Paper {doc}",
+        )
+
+    # Ninety-nine papers that match strongly, one that matches too.
+    chunks = [chunk(f"loud{d}", 0, "kidney segmentation " * 5) for d in range(99)]
+    chunks += [chunk("quiet", 0, "kidney segmentation of the renal cortex")]
+
+    pipe = RetrievalPipeline(dense=None, bm25=BM25Retriever(), reranker=None)
+    pipe.index(chunks)
+    cfg = RetrievalConfig("bm25 only", use_dense=False, use_bm25=True,
+                          use_rerank=False, candidates=5, top_k=5)
+
+    got = pipe.search("kidney segmentation", cfg, doc_ids={"quiet"})
+    assert [r.chunk.doc_id for r in got] == ["quiet"]
+
+
+def test_choosing_one_paper_does_not_cap_its_passages():
+    """The diversity cap stops one paper filling the context on an open
+    question. When a reader has chosen that paper, the cap is the opposite of
+    what they asked for — and the thin evidence that resulted produced a
+    refusal, which read as the paper having nothing to say."""
+    from researchlens.engine import Engine, SERVING
+
+    def chunk(i: int) -> Chunk:
+        return Chunk(
+            chunk_id=f"solo:{i}", doc_id="solo", ordinal=i, text=f"passage {i}",
+            section_kind="results", section_heading="Results",
+            page_start=1, page_end=1, doc_title="The Only Paper",
+        )
+
+    from researchlens.types import Retrieved
+
+    evidence = [Retrieved(chunk=chunk(i), score=1.0 - i / 100) for i in range(8)]
+
+    capped = Engine._diversify(evidence, per_doc=3, limit=SERVING.top_k)
+    assert len(capped) == 3, "the open-question cap still applies"
+
+    chosen = Engine._diversify(evidence, per_doc=SERVING.top_k, limit=SERVING.top_k)
+    assert len(chosen) == SERVING.top_k, "a chosen paper may fill the context"

@@ -124,8 +124,12 @@ class Engine:
         if matrix is None:
             self.pipeline.index(self.chunks)
         else:
-            self.pipeline._by_id = {c.chunk_id: c for c in self.chunks}
-            self.pipeline.bm25.index(self.chunks)
+            # The bundle already holds the dense vectors, so only BM25 needs
+            # building — but the pipeline's own bookkeeping must still happen,
+            # or the row indices that restrict retrieval to chosen papers will
+            # not exist. Reaching past index() to set one field was how that
+            # broke.
+            self.pipeline.index_without_dense(self.chunks)
 
     def _load_bundle(self, bundle: Path) -> None:
         """Read passages and vectors exported by scripts/export_bundle.py."""
@@ -205,14 +209,19 @@ class Engine:
 
     # ---- answering -------------------------------------------------------
 
-    def retrieve(self, question: str, top_k: int | None = None) -> tuple[list[Retrieved], float]:
+    def retrieve(
+        self,
+        question: str,
+        top_k: int | None = None,
+        doc_ids: set[str] | None = None,
+    ) -> tuple[list[Retrieved], float]:
         if self.pipeline is None:
             raise RuntimeError("Engine.load() has not been called")
         config = SERVING if top_k is None else RetrievalConfig(
             label=SERVING.label, use_dense=True, use_bm25=True, use_rerank=True,
             candidates=SERVING.candidates, top_k=top_k,
         )
-        return self.pipeline.timed_search(question, config)
+        return self.pipeline.timed_search(question, config, doc_ids)
 
     async def live_evidence(self, question: str, max_results: int = 6) -> list[Retrieved]:
         """Fetch recent papers when the corpus cannot speak to the question.
@@ -340,6 +349,7 @@ class Engine:
         provider_name: str = "local",
         history=None,
         live: bool | None = None,
+        doc_ids: set[str] | None = None,
     ) -> Answer:
         """Retrieve, generate, then check what came back.
 
@@ -348,7 +358,7 @@ class Engine:
         context answers from its training, fluently, and a fluent unsourced
         answer is worse than a refusal because a reader cannot tell them apart.
         """
-        evidence, retrieval_ms = self.retrieve(question)
+        evidence, retrieval_ms = self.retrieve(question, doc_ids=doc_ids)
         provider = self.provider(provider_name)
 
         # Whether to reach outside the corpus is decided from what the corpus
@@ -357,15 +367,27 @@ class Engine:
         # corpus, is the failure that looks most like success — real citations,
         # eight-year-old evidence, no indication of either.
         if live is None:
-            live = asks_for_a_survey(question)
+            # Never when a subset is chosen. Asking "what does this paper say"
+            # and receiving abstracts from elsewhere answers a question nobody
+            # asked, and a reader who selected two papers has said plainly that
+            # the rest of the literature is not what they want.
+            live = asks_for_a_survey(question) and not doc_ids
 
         if live:
             fetched = await self.live_evidence(question)
             if fetched:
                 evidence = self._merge_live(question, fetched, evidence)
 
-        # One paper should not fill the context on an ordinary question either.
-        evidence = self._diversify(evidence, per_doc=3, limit=SERVING.top_k)
+        # One paper should not fill the context on an ordinary question. When a
+        # reader has *chosen* the papers, the cap is the opposite of what they
+        # asked for: selecting a single paper and receiving three passages from
+        # it is a worse answer than the corpus could give, and the refusal that
+        # followed looked like the paper had nothing to say.
+        evidence = self._diversify(
+            evidence,
+            per_doc=SERVING.top_k if doc_ids else 3,
+            limit=SERVING.top_k,
+        )
 
         if not evidence:
             return Answer(

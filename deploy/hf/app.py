@@ -176,7 +176,7 @@ def _evidence_markdown(citations) -> str:
     return "\n".join(rows)
 
 
-def _ask_on_gpu(question: str) -> tuple[str, str, str]:
+def _ask_on_gpu(question: str, doc_ids: set[str] | None = None) -> tuple[str, str, str]:
     """Retrieve with the engine, generate on the attached GPU, then check.
 
     Retrieval and grounding are the engine's, unchanged — only the call that
@@ -187,9 +187,11 @@ def _ask_on_gpu(question: str) -> tuple[str, str, str]:
     with nothing supported becomes a refusal.
     """
     started = time.perf_counter()
-    evidence, retrieval_ms = ENGINE.retrieve(question)
+    evidence, retrieval_ms = ENGINE.retrieve(question, doc_ids=doc_ids)
 
-    if ENGINE.settings and question and _asks_for_survey(question):
+    # Not when a subset is chosen: a reader who picked two papers has said the
+    # rest of the literature is not what they want.
+    if not doc_ids and question and _asks_for_survey(question):
         fetched = asyncio.run(ENGINE.live_evidence(question))
         if fetched:
             evidence = ENGINE._merge_live(question, fetched, evidence)
@@ -214,15 +216,27 @@ def _ask_on_gpu(question: str) -> tuple[str, str, str]:
     return text, _evidence_markdown(citations), timing
 
 
-def ask(question: str, provider: str) -> tuple[str, str, str]:
+#: Paper label -> doc_id, for the selector. Titles are truncated because a few
+#: run past a hundred characters and a dropdown is not a place to read one.
+PAPER_CHOICES = sorted(
+    ((f"{d.title[:88]}", d.doc_id) for d in ENGINE.documents),
+    key=lambda t: t[0].lower(),
+)
+
+
+def ask(question: str, provider: str, papers: list[str] | None = None) -> tuple[str, str, str]:
     question = (question or "").strip()
     if len(question) < 3:
         return "Ask a question about the indexed papers.", "", ""
 
+    # An empty selection means the whole corpus, which is the common case and
+    # should not require choosing a hundred and one things.
+    doc_ids = set(papers) if papers else None
+
     try:
         if provider == "gpu":
-            return _ask_on_gpu(question)
-        answer = asyncio.run(ENGINE.ask(question, provider))
+            return _ask_on_gpu(question, doc_ids)
+        answer = asyncio.run(ENGINE.ask(question, provider, doc_ids=doc_ids))
     except ValueError as e:
         return f"**{e}**", "", ""
     except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
@@ -278,6 +292,13 @@ This is a read-only exhibit of a system that runs locally with no API key —
             label="Model",
             scale=1,
         )
+    papers = gr.Dropdown(
+        choices=PAPER_CHOICES,
+        value=[],
+        multiselect=True,
+        label="Papers (leave empty to search all 101)",
+        info="Pick one or more to confine the answer to them.",
+    )
     submit = gr.Button("Ask", variant="primary")
 
     answer_box = gr.Markdown(label="Answer")
@@ -290,8 +311,10 @@ This is a read-only exhibit of a system that runs locally with no API key —
 
     gr.Examples(examples=[[q] for q in EXAMPLES], inputs=[question])
 
-    submit.click(ask, [question, provider], [answer_box, evidence_box, timing_box])
-    question.submit(ask, [question, provider], [answer_box, evidence_box, timing_box])
+    inputs = [question, provider, papers]
+    outputs = [answer_box, evidence_box, timing_box]
+    submit.click(ask, inputs, outputs)
+    question.submit(ask, inputs, outputs)
 
 
 # No custom /health here, deliberately. Gradio builds its FastAPI app inside
