@@ -43,13 +43,20 @@ class CrossEncoderReranker:
         if self._encoder is None:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-            from researchlens.retrieval.dense import _select_providers
-
-            kwargs: dict = {"model_name": self.model, "threads": self.threads}
-            providers = _select_providers()
-            if providers:
-                kwargs["providers"] = providers
-            self._encoder = TextCrossEncoder(**kwargs)
+            # CPU, deliberately, and *not* the CoreML provider the embedder
+            # uses. Measured on this machine, 30 real passages of ~900 chars:
+            #
+            #   CoreML             12408 ms
+            #   CPU                  507 ms
+            #   CPU, threads=8       471 ms
+            #
+            # CoreML is 24x slower here while being 2.6x faster for the
+            # bi-encoder. onnxruntime reports why: of 327 graph nodes it can
+            # place 212, split across 39 partitions, so every forward pass
+            # thrashes between CPU and the neural engine. The lesson is that a
+            # provider is a property of the model, not of the machine — this
+            # cost 111 seconds per query before it was measured.
+            self._encoder = TextCrossEncoder(model_name=self.model, threads=self.threads)
         return self._encoder
 
     def rerank(

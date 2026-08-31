@@ -24,6 +24,9 @@ corpus: ## download the evaluation corpus (~25 open-access papers)
 ingest: ## parse a folder of papers into the library cache (DIR=/path/to/papers)
 	$(PY) -m researchlens.ingest.library $(or $(DIR),data/pdfs)
 
+verify: ## end-to-end check on the real corpus and models
+	$(PY) scripts/verify.py
+
 test: ## run the unit tests
 	$(PY) -m pytest -q
 
