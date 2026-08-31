@@ -274,6 +274,14 @@ def _looks_like_quota(err: Exception) -> bool:
     )
 
 
+#: Which model actually wrote the last answer on this path. The timing line
+#: used to report GPU_MODEL unconditionally, so an answer written by the
+#: fallback was still credited to the 3B — a reader comparing two answers
+#: would have been told the same model produced both. Set where the writing
+#: happens; read where it is reported.
+_LAST_WRITER = GPU_MODEL
+
+
 def _stream_from_gpu(question, evidence, history):
     """Generate on the attached GPU, yielding text as it arrives.
 
@@ -284,7 +292,10 @@ def _stream_from_gpu(question, evidence, history):
     were actually retrieved, an invented one is removed, and an answer left
     with nothing supported becomes a refusal.
     """
+    global _LAST_WRITER
+
     system, user = build_prompt(question, evidence, history)
+    _LAST_WRITER = GPU_MODEL
     try:
         yield from _stream_on_gpu(system, user)
         return
@@ -305,6 +316,7 @@ def _stream_from_gpu(question, evidence, history):
     if provider is None:
         raise first
     print(f"  GPU unavailable ({first}); writing with {FALLBACK_MODEL}", flush=True)
+    _LAST_WRITER = FALLBACK_MODEL
     yield from _sync_stream(question, evidence, history, provider=provider)
 
 
@@ -487,7 +499,7 @@ def respond(message, history, provider, papers, live_mode, session):
         # not.
         text, citations = NO_EVIDENCE, []
 
-    model = GPU_MODEL if provider == "gpu" else ENGINE.provider(provider).model
+    model = _LAST_WRITER if provider == "gpu" else ENGINE.provider(provider).model
     timing = f"{model} · retrieval {retrieval_ms:.0f} ms · generation {generation_ms:.0f} ms · {found}"
     yield (preamble + text, _evidence_markdown(citations, mine), timing, session, choices)
 
@@ -669,7 +681,7 @@ def ask_json(
             }
             for c in citations
         ],
-        "model": GPU_MODEL if provider == "gpu" else ENGINE.provider(provider).model,
+        "model": _LAST_WRITER if provider == "gpu" else ENGINE.provider(provider).model,
         "retrieval_ms": round(retrieval_ms, 1),
         "generation_ms": round(generation_ms, 1),
         "passages": len(evidence),
