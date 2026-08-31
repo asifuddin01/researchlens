@@ -253,6 +253,28 @@ class Engine:
         hits, _ms = self.retrieve(question, top_k=20)
         return len({r.chunk.doc_id for r in hits if r.score >= threshold})
 
+    @staticmethod
+    def _diversify(results: list[Retrieved], per_doc: int, limit: int) -> list[Retrieved]:
+        """Cap how many passages any one paper contributes.
+
+        Without this, asked what the current research trend in LLMs is, six of
+        eight passages came from a single survey paper. The answer was then a
+        summary of that paper wearing the question's clothes — and a reader
+        cannot tell a synthesis across the literature from a paraphrase of one
+        document, because both arrive with citations.
+        """
+        kept: list[Retrieved] = []
+        seen: dict[str, int] = {}
+        for r in results:
+            n = seen.get(r.chunk.doc_id, 0)
+            if n >= per_doc:
+                continue
+            seen[r.chunk.doc_id] = n + 1
+            kept.append(r)
+            if len(kept) >= limit:
+                break
+        return kept
+
     def _merge_live(
         self, question: str, fetched: list[Retrieved], corpus: list[Retrieved]
     ) -> list[Retrieved]:
@@ -271,25 +293,46 @@ class Engine:
         does not answer the question drops out, whichever index it came from,
         and nothing needs to know which sources suit which questions.
         """
-        pool = fetched + corpus
         if self.pipeline is None or self.pipeline.reranker is None:
-            return pool[: SERVING.top_k]
+            return (fetched + corpus)[: SERVING.top_k]
 
-        by_id = {r.chunk.chunk_id: r for r in pool}
-        ranked = self.pipeline.reranker.rerank(
-            question, [r.chunk for r in pool], SERVING.top_k
+        def rerank(pool: list[Retrieved], k: int) -> list[Retrieved]:
+            if not pool:
+                return []
+            by_id = {r.chunk.chunk_id: r for r in pool}
+            return [
+                Retrieved(
+                    chunk=by_id[cid].chunk, score=score,
+                    dense_score=by_id[cid].dense_score,
+                    bm25_score=by_id[cid].bm25_score,
+                    rerank_score=score, sources=by_id[cid].sources,
+                )
+                for cid, score in self.pipeline.reranker.rerank(
+                    question, [r.chunk for r in pool], k
+                )
+            ]
+
+        # Live and corpus evidence are ranked separately, then interleaved,
+        # rather than competing in one pool.
+        #
+        # Ranking them together does not work for the question live search
+        # exists to answer. Asked what the current research trend in LLMs is,
+        # six recent papers were fetched and one survived: a cross-encoder
+        # scores topical relevance, and a 2024 survey already in the corpus
+        # reads as more relevant to "research trend in LLMs" than a 2026
+        # abstract about one narrow result. It is more relevant. It is also
+        # eight years of literature out of date, which is the thing being
+        # asked about.
+        #
+        # So recency gets guaranteed room: at least half the evidence on a
+        # survey question comes from the live half, if the live half found
+        # anything at all.
+        live_slots = min(len(fetched), max(2, SERVING.top_k // 2))
+        live_part = self._diversify(rerank(fetched, live_slots * 2), 1, live_slots)
+        corpus_part = self._diversify(
+            rerank(corpus, SERVING.top_k), 2, SERVING.top_k - len(live_part)
         )
-        return [
-            Retrieved(
-                chunk=by_id[cid].chunk,
-                score=score,
-                dense_score=by_id[cid].dense_score,
-                bm25_score=by_id[cid].bm25_score,
-                rerank_score=score,
-                sources=by_id[cid].sources,
-            )
-            for cid, score in ranked
-        ]
+        return live_part + corpus_part
 
     async def ask(
         self,
@@ -320,6 +363,9 @@ class Engine:
             fetched = await self.live_evidence(question)
             if fetched:
                 evidence = self._merge_live(question, fetched, evidence)
+
+        # One paper should not fill the context on an ordinary question either.
+        evidence = self._diversify(evidence, per_doc=3, limit=SERVING.top_k)
 
         if not evidence:
             return Answer(

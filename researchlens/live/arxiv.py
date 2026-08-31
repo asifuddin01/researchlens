@@ -105,12 +105,31 @@ async def search(
         await asyncio.sleep(wait)
     _last_call = asyncio.get_event_loop().time()
 
+    query = build_query(question)
+    terms = query.count(" AND ") + 1
+
+    # A broad query sorted by date is noise. "What is the current research
+    # trend in LLMs?" reduces to the single term "llm" once the question words
+    # are stripped, and the newest arXiv papers mentioning LLMs were about
+    # plastic upcycling and radio-access schedulers — recent, and no answer.
+    #
+    # So a narrow query is date-sorted, because for a specific topic the newest
+    # matches are the point; a broad one is relevance-sorted inside a date
+    # window, which keeps recency without surrendering topicality. PubMed
+    # needed the same correction for the same reason.
+    if terms >= 3:
+        order = {"sortBy": "submittedDate", "sortOrder": "descending"}
+    else:
+        order = {"sortBy": "relevance", "sortOrder": "descending"}
+        if since_days:
+            start = (date.today() - timedelta(days=since_days)).strftime("%Y%m%d")
+            query = f"({query}) AND submittedDate:[{start}0000 TO 999912312359]"
+
     params = {
-        "search_query": build_query(question),
+        "search_query": query,
         "start": "0",
         "max_results": str(max_results),
-        "sortBy": "submittedDate",
-        "sortOrder": "descending",
+        **order,
     }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
