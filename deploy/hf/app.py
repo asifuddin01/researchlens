@@ -520,7 +520,12 @@ Runs locally with no API key —
         # ChatInterface renders the additional inputs itself, in this
         # accordion. Rendering them again below raises DuplicateBlockError —
         # a component belongs to exactly one place in the layout.
-        additional_inputs_accordion=gr.Accordion("Scope and model", open=False),
+        # render=False, or it appears twice: creating an Accordion inside a
+        # Blocks context registers it in the layout at that point, and
+        # ChatInterface then renders it again around the inputs.
+        additional_inputs_accordion=gr.Accordion(
+            "Scope and model", open=False, render=False
+        ),
         additional_outputs=[evidence_box, timing_box, session, papers],
         examples=[[{"text": q, "files": []}] for q in EXAMPLES],
         editable=True,
