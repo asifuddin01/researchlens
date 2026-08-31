@@ -225,6 +225,41 @@ def _evidence_markdown(citations, mine: set[str] | None = None) -> str:
     return "\n".join(rows)
 
 
+#: A generation fallback that needs no GPU allocation.
+#:
+#: ZeroGPU is rationed per visitor, and a spent allowance turned the demo into
+#: a wall of unsummarised passages — technically the evidence, but not what
+#: anyone asked for. Hugging Face's router speaks the OpenAI protocol and takes
+#: the same token the Space already authenticates with, so one secret buys a
+#: writer that keeps working when the GPU quota does not.
+#:
+#: Absent by default and absent is fine: without a token this is simply not
+#: offered, and the evidence-only path still catches the failure. The project's
+#: claim that it runs with no API key is about the *local* build, which is
+#: where it matters; a hosted demo borrowing a hosted model breaks nothing.
+HF_ROUTER = "https://router.huggingface.co/v1"
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+
+def _fallback_provider():
+    """A hosted writer, or None when no token is configured."""
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if not token:
+        return None
+    from researchlens.generate.openai_compat import OpenAICompatProvider
+
+    return OpenAICompatProvider(
+        base_url=HF_ROUTER, api_key=token, model=FALLBACK_MODEL
+    )
+
+
+def _looks_like_quota(err: Exception) -> bool:
+    text = str(err).lower()
+    return any(
+        w in text for w in ("quota", "exceeded", "rate limit", "429", "gpu task aborted")
+    )
+
+
 def _stream_from_gpu(question, evidence, history):
     """Generate on the attached GPU, yielding text as it arrives.
 
@@ -238,11 +273,25 @@ def _stream_from_gpu(question, evidence, history):
     system, user = build_prompt(question, evidence, history)
     try:
         yield from _stream_on_gpu(system, user)
+        return
     except Exception as e:  # noqa: BLE001
-        # Streaming is presentation. Losing it should cost the reader a
-        # progress bar, not an answer.
-        print(f"  GPU streaming failed, falling back to one call: {e}", flush=True)
-        yield _generate_on_gpu(system, user)
+        first = e
+        if not _looks_like_quota(e):
+            # Streaming is presentation. Losing it should cost the reader a
+            # progress bar, not an answer.
+            print(f"  GPU streaming failed, one call instead: {e}", flush=True)
+            try:
+                yield _generate_on_gpu(system, user)
+                return
+            except Exception as e2:  # noqa: BLE001
+                first = e2
+
+    # The allocation itself is unavailable, so retrying it is pointless.
+    provider = _fallback_provider()
+    if provider is None:
+        raise first
+    print(f"  GPU unavailable ({first}); writing with {FALLBACK_MODEL}", flush=True)
+    yield from _sync_stream(question, evidence, history, provider=provider)
 
 
 #: Paper label -> doc_id, for the selector. Titles are truncated because a few
@@ -301,14 +350,14 @@ def _pairs(messages, limit: int = 1):
     return out[-limit:]
 
 
-def _sync_stream(question, evidence, history, provider_name):
+def _sync_stream(question, evidence, history, provider_name=None, provider=None):
     """Drain an async provider stream from synchronous Gradio code.
 
     Gradio's handler is a plain generator and the providers are async. Running
     the coroutine to completion first would defeat the point, so the loop is
     stepped one chunk at a time and each is handed back as it lands.
     """
-    provider = ENGINE.provider(provider_name)
+    provider = provider or ENGINE.provider(provider_name)
     req = GenerationRequest(question=question, evidence=evidence, history=history)
     loop = asyncio.new_event_loop()
     try:
@@ -440,11 +489,50 @@ def corpus_stats() -> dict:
     }
 
 
+def add_paper(file_path: str, session: str = "") -> dict:
+    """Index one uploaded PDF for a caller's session, and say what it was.
+
+    The website's own ask panel calls this; the Space's chat box does the same
+    thing through its message box. Both land in the same per-session index,
+    never written to disk and never merged into the public corpus — see
+    researchlens/uploads.py for why that is a correctness requirement rather
+    than caution.
+    """
+    session = session or secrets.token_urlsafe(16)
+    if not file_path:
+        return {"error": "No file was sent.", "session": session}
+
+    path = Path(file_path)
+    try:
+        doc = ENGINE.add_upload(session, path.read_bytes(), path.name)
+    except UploadError as e:
+        return {"error": str(e), "session": session}
+    except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
+        return {"error": f"{path.name} could not be read: {e}", "session": session}
+
+    return {
+        "session": session,
+        "doc_id": doc.doc_id,
+        "title": doc.title or path.name,
+        "pages": doc.n_pages,
+        "papers_open": len(ENGINE.uploaded_documents(session)),
+        "limit": MAX_PAPERS_PER_SESSION,
+    }
+
+
+def forget_papers(session: str = "") -> dict:
+    """Drop a caller's uploaded papers now rather than at the timeout."""
+    if session:
+        ENGINE.drop_uploads(session)
+    return {"session": session, "papers_open": 0}
+
+
 def ask_json(
     question: str,
     provider: str = "",
     papers: list[str] | None = None,
     live: str = "auto",
+    session: str = "",
 ) -> dict:
     """One answer, with its citations, as data.
 
@@ -462,7 +550,9 @@ def ask_json(
 
     try:
         evidence, retrieval_ms = asyncio.run(
-            ENGINE.evidence_for(question, live=want_live, doc_ids=doc_ids)
+            ENGINE.evidence_for(
+                question, live=want_live, doc_ids=doc_ids, session=session or None
+            )
         )
     except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
         return {"error": f"Retrieval failed: {e}"}
@@ -473,6 +563,8 @@ def ask_json(
             "retrieval_ms": round(retrieval_ms, 1), "generation_ms": 0.0,
             "passages": 0, "papers": 0,
         }
+
+    mine = {d.doc_id for d in ENGINE.uploaded_documents(session or None)}
 
     started = time.perf_counter()
     try:
@@ -500,6 +592,7 @@ def ask_json(
                     "pages": r.chunk.pages,
                     "quote": r.chunk.text[:400],
                     "live": is_live(r.chunk.chunk_id),
+                    "yours": r.chunk.doc_id in mine,
                 }
                 for i, r in enumerate(evidence, start=1)
             ],
@@ -526,6 +619,7 @@ def ask_json(
                 "pages": c.pages,
                 "quote": c.quote,
                 "live": is_live(c.chunk_id),
+                "yours": c.chunk_id.split(":", 1)[0] in mine,
             }
             for c in citations
         ],
@@ -653,6 +747,8 @@ Runs locally with no API key —
     # the app served fine.
     gr.api(ask_json, api_name="ask_json")
     gr.api(corpus_stats, api_name="corpus_stats")
+    gr.api(add_paper, api_name="add_paper")
+    gr.api(forget_papers, api_name="forget_papers")
 
     timing_box.render()
     with gr.Accordion("Evidence", open=True):
