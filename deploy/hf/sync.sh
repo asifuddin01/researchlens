@@ -35,6 +35,14 @@ rm -rf "$DEST/data"
 mkdir -p "$DEST/data"
 cp -R "$SRC/data/bundle" "$DEST/data/bundle"
 
+# Hugging Face's git refuses plain files over 10 MB, and both bundle files are
+# at or past that. Without this the push fails partway with a message about
+# LFS, after the upload has already started.
+cat > "$DEST/.gitattributes" <<'ATTRS'
+*.npz filter=lfs diff=lfs merge=lfs -text
+data/bundle/chunks.jsonl filter=lfs diff=lfs merge=lfs -text
+ATTRS
+
 find "$DEST" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
 echo "Assembled in $DEST"
