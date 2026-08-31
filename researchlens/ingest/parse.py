@@ -81,6 +81,18 @@ _FURNITURE = re.compile(
     re.I,
 )
 
+# A superscript citation marker: digits, or a small run of them, set well below
+# body size. These are interleaved into the text by extraction — "these 9 10
+# models", and worse "interfer-" "13" "ence", which breaks a word in half — so
+# they cost both noise and recall.
+_MARKER = re.compile(r"^[0-9]{1,3}(?:[,\u2013-][0-9]{1,3})*$")
+
+# Fraction of a page's median word size below which a purely numeric token is a
+# superscript rather than a value. Deliberately well under 1.0: metric values in
+# prose ("a Dice score of 0.94") are set at body size and must survive, because
+# exact numbers are precisely what lexical retrieval exists to find.
+_MARKER_SIZE_RATIO = 0.82
+
 # Figure panel labels: "a", "a b", "f g h i". Every token a single letter.
 _PANEL_LABELS = re.compile(r"^\s*[a-z]([\s,]+[a-z])*\s*$", re.I)
 
@@ -272,6 +284,19 @@ def _lines_from_page(page: pdfplumber.page.Page, page_no: int) -> list[_Line]:
         # A page that is a scanned image, or otherwise has no text layer.
         return []
 
+    # Drop superscript citation markers before anything else sees them.
+    sizes = sorted(w.get("size", 0.0) for w in words if w.get("size"))
+    if sizes:
+        page_body = sizes[len(sizes) // 2]
+        words = [
+            w
+            for w in words
+            if not (
+                _MARKER.match(w["text"])
+                and w.get("size", page_body) < page_body * _MARKER_SIZE_RATIO
+            )
+        ]
+
     buckets: dict[float, list[dict]] = {}
     for w in words:
         key = round(w["top"] * 2) / 2
@@ -443,6 +468,68 @@ def _heading_levels(headings: list[_Line]) -> dict[float, int]:
     return {s: i + 1 for i, s in enumerate(sizes)}
 
 
+_LINEBREAK_HYPHEN = re.compile(r"(\w+)-\s+(\w+)")
+
+
+def _dehyphenate(text: str, vocab: set[str]) -> str:
+    """Rejoin words broken across a line by justification.
+
+    Typesetting splits "expression" into "expres-" and "sion" at a line end,
+    and joining lines with a space preserves the break as "expres- sion" — a
+    token that matches no query, lexically or densely. About 45 of these occur
+    per paper in this corpus, so leaving them costs real recall.
+
+    The difficulty is that a hyphen at a line end is ambiguous: "single-" then
+    "cell" is a real compound that must keep its hyphen, while "expres-" then
+    "sion" must lose it. No rule reads both correctly from the characters
+    alone, so the decision is made against the *document's own vocabulary* —
+    words the paper uses elsewhere, unbroken. That needs no wordlist, no
+    language assumption, and adapts to the paper's own jargon.
+
+    The ladder, in order:
+
+    1. A continuation is lowercase. "mod-" followed by "7" is a superscript
+       reference marker, and "Gene-" followed by "GEARS" is a caption artefact;
+       neither is a broken word.
+    2. If the joined form appears elsewhere in the document, join it.
+       "expression" does, so "expres- sion" becomes "expression".
+    3. If the hyphenated form appears elsewhere, keep the hyphen.
+    4. If both halves are themselves words the document uses, keep the hyphen —
+       "gene" and "models" are both real, so "Gene- models" is a compound
+       broken at a line end, not a broken word.
+
+    Anything left over is joined, because a soft hyphen is much the commoner
+    reason for a hyphen to sit at the end of a line.
+    """
+
+    def resolve(m: re.Match[str]) -> str:
+        a, b = m.group(1), m.group(2)
+        if not b[:1].islower():
+            return m.group(0)
+        merged = f"{a}{b}"
+        hyphenated = f"{a}-{b}"
+        if merged.lower() in vocab:
+            return merged
+        if hyphenated.lower() in vocab:
+            return hyphenated
+        if a.lower() in vocab and b.lower() in vocab:
+            return hyphenated
+        return merged
+
+    return _LINEBREAK_HYPHEN.sub(resolve, text)
+
+
+def _document_vocabulary(lines: list[_Line]) -> set[str]:
+    """Words the document uses, for deciding hyphenation.
+
+    Built from tokens that are *not* adjacent to a line-break hyphen, so a
+    broken word never votes for its own broken form.
+    """
+    joined = " ".join(ln.text for ln in lines)
+    cleaned = _LINEBREAK_HYPHEN.sub(" ", joined)
+    return {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z-]{1,}", cleaned)}
+
+
 def parse_pdf(path: str | Path) -> Document:
     """Parse one PDF into a `Document` with real sections and page spans.
 
@@ -479,6 +566,7 @@ def parse_pdf(path: str | Path) -> Document:
         )
 
     body = _body_size(lines)
+    vocab = _document_vocabulary(lines)
     title = _extract_title(lines)
     authors = _extract_authors(lines, title, body)
 
@@ -506,6 +594,7 @@ def parse_pdf(path: str | Path) -> Document:
     def close(end_page: int) -> None:
         text = " ".join(buf).strip()
         text = re.sub(r"\s+", " ", text)
+        text = _dehyphenate(text, vocab)
         # Sections shorter than a sentence are heading-detection noise: a
         # two-column split heading, a caption misread as a division.
         if len(text) >= 40:
