@@ -11,6 +11,7 @@ make the demo unusable and the memory ceiling unreachable.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -51,9 +52,20 @@ from researchlens.types import Answer, Chunk, Document, Retrieved
 # regardless of what the corpus happens to hold — the prompt labels each source
 # correctly, so combining them is safe.
 
+#: Candidates reranked per query. The cross-encoder is 95% of retrieval time —
+#: 45 ms without it locally, 855 ms with — so this is the one number that
+#: decides whether a demo feels responsive.
+#:
+#: Thirty is right where CPU is plentiful. On the free Space it is not: no
+#: CoreML, a weaker core, and the same thirty passes took 13.6 s against 855 ms
+#: locally. Lowering it there trades a little ordering quality for a demo that
+#: answers while someone is still watching, and the ablation has not yet shown
+#: the reranker earns those extra candidates anyway.
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "30"))
+
 SERVING = RetrievalConfig(
     label="hybrid + rerank", use_dense=True, use_bm25=True, use_rerank=True,
-    candidates=30, top_k=8,
+    candidates=RERANK_CANDIDATES, top_k=8,
 )
 
 

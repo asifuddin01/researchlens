@@ -67,6 +67,12 @@ except ImportError:
     # Not on a ZeroGPU Space — running locally, or on CPU hardware.
     ON_ZERO_GPU = False
 
+# Twelve rather than thirty. The cross-encoder dominates retrieval time and the
+# Space's CPU is much weaker than a laptop's — thirty passes measured 13.6 s
+# there against 855 ms locally. Set before the engine is built, because the
+# serving configuration is read at import.
+os.environ.setdefault("RERANK_CANDIDATES", "12")
+
 ENGINE = Engine(Settings.from_env())
 ENGINE.load()
 
