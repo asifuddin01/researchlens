@@ -63,6 +63,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_origins=settings.allowed_origins,
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type"],
+        # A page on https://asifuddin.com reaching an instance on localhost is
+        # a public origin calling a private address, which Chrome blocks unless
+        # the server opts in. The browser reports ERR_BLOCKED_BY_CLIENT, which
+        # looks like an ad blocker and is not one; without this the preflight
+        # is refused with "Disallowed CORS private-network" and the real
+        # request is never sent.
+        #
+        # This widens nothing: origin is still checked against the list above,
+        # so a page not on it is refused exactly as before.
+        allow_private_network=True,
     )
 
     @app.get("/health")
