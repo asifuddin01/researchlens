@@ -1,8 +1,8 @@
 {
   "chunking": "c1000-o180",
-  "parser_version": 9,
+  "parser_version": 12,
   "embedding_model": "BAAI/bge-small-en-v1.5",
   "papers": 101,
-  "chunks": 9870,
+  "chunks": 9593,
   "dim": 384
 }
