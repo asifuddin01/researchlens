@@ -18,6 +18,7 @@ because the two are indistinguishable to a reader.
 
 from __future__ import annotations
 
+from researchlens.live.arxiv import is_live
 from researchlens.types import Retrieved
 
 SYSTEM = """You answer questions about scientific papers using only the numbered passages provided.
@@ -115,12 +116,31 @@ def build_prompt(question: str, evidence: list[Retrieved], history=None) -> tupl
 
     scope = ""
     if asks_for_a_survey(question):
-        scope = (
-            "\nThis question asks about a field, not about these passages. "
-            "Answer only what these papers show, and say in one clause that "
-            "this is a fixed set of indexed papers rather than a survey of "
-            "current literature.\n"
-        )
+        # Two versions, because the single one went stale the day live search
+        # landed. It told the model its evidence was "a fixed set of indexed
+        # papers" even when half of it was abstracts fetched from arXiv,
+        # PubMed and OpenAlex minutes earlier — instructing the model to
+        # discount the very evidence that had been added to answer this kind
+        # of question. Asked what is current in long-context language models
+        # the model refused, with three recent abstracts in front of it.
+        recent = [r for r in evidence if is_live(r.chunk.chunk_id)]
+        if recent:
+            scope = (
+                f"\nThis question asks what a field is doing now. {len(recent)} of "
+                "the passages above are abstracts of recent papers, fetched "
+                "just now from literature search; the rest are from a fixed "
+                "indexed corpus. Say what those recent papers are working on, "
+                "cite them, and note that abstracts show what a paper claims "
+                "rather than what it measured. Do not present a handful of "
+                "papers as a complete survey of the field.\n"
+            )
+        else:
+            scope = (
+                "\nThis question asks about a field, not about these passages. "
+                "Answer only what these papers show, and say in one clause that "
+                "this is a fixed set of indexed papers rather than a survey of "
+                "current literature.\n"
+            )
 
     user = f"""Passages:
 

@@ -298,6 +298,9 @@ class Engine:
             # One uploaded paper should be readable in depth; three should not
             # have one of them crowd out the other two.
             per_doc = max(2, -(-slots // max(docs, 1)))
+        # No relevance floor here, unlike live results. A reader who uploaded a
+        # paper has said it is the thing they want read; the cross-encoder
+        # being unimpressed by it is not grounds to overrule them.
         return self._merge_reserved(question, uploaded, corpus, slots, per_doc, 2, k)
 
     async def live_evidence(self, question: str, max_results: int = 9) -> list[Retrieved]:
@@ -423,7 +426,9 @@ class Engine:
         slots = min(len(fetched), max(2, SERVING.top_k // 2))
         # One live abstract per paper: six abstracts from six papers is a view
         # of the field, which is what a survey question asked for.
-        return self._merge_reserved(question, fetched, corpus, slots, 1, 2, SERVING.top_k)
+        return self._merge_reserved(
+            question, fetched, corpus, slots, 1, 2, SERVING.top_k, floor_gap=1.5
+        )
 
     def _merge_reserved(
         self,
@@ -434,6 +439,7 @@ class Engine:
         reserved_per_doc: int,
         rest_per_doc: int,
         limit: int,
+        floor_gap: float | None = None,
     ) -> list[Retrieved]:
         """Rank two pools separately, then give one of them guaranteed room.
 
@@ -466,33 +472,60 @@ class Engine:
                 )
             ]
 
+        ranked_rest = rerank(rest, limit)
         head = self._diversify(rerank(reserved, slots * 2), reserved_per_doc, slots)
-        tail = self._diversify(rerank(rest, limit), rest_per_doc, limit - len(head))
+
+        if floor_gap is not None and ranked_rest:
+            # A reserved slot is for recency, not for charity. Asked what is
+            # current in long-context language models, PubMed returned "Towards
+            # conversational artificial intelligence for disease management" at
+            # -0.89 while the corpus had GPT-3 at +0.84 — and the reserved slot
+            # handed the off-topic abstract half the evidence. The model then
+            # refused, correctly, and live search took the blame for a merge
+            # decision.
+            #
+            # So a reserved item must be in the same conversation as the best
+            # thing it displaces. Relative rather than absolute because the
+            # cross-encoder's scale moves with the question: on "open problems
+            # in AI for radiology" every passage in the pool scored negative
+            # and the live ones were still the right answer. Observed gaps —
+            #
+            #   long-context   best rest +0.84   kept +1.24 +0.81 +0.09
+            #                                    dropped -0.89   (gap 1.73)
+            #   radiology      best rest -0.97   kept -1.16 -1.48 -2.35
+            #   federated      best rest +2.77   kept +5.73 +4.96 +0.90 +0.28
+            #
+            # — put the boundary between 0.75 and 1.73, and 1.5 sits inside it
+            # with room either side. It is a threshold fitted to three
+            # questions, which is what it is: a guard against the obviously
+            # irrelevant, not a calibrated decision rule.
+            floor = ranked_rest[0].score - floor_gap
+            head = [r for r in head if r.score >= floor]
+
+        tail = self._diversify(ranked_rest, rest_per_doc, limit - len(head))
         return head + tail
 
-    async def ask(
+    async def evidence_for(
         self,
         question: str,
-        provider_name: str = "local",
-        history=None,
         live: bool | None = None,
         doc_ids: set[str] | None = None,
         session: str | None = None,
-    ) -> Answer:
-        """Retrieve, generate, then check what came back.
+    ) -> tuple[list[Retrieved], float]:
+        """Everything between a question and a prompt, in one place.
 
-        The order matters. Retrieval happens first and, when it returns
-        nothing, the model is never called — a model asked a question with no
-        context answers from its training, fluently, and a fluent unsourced
-        answer is worse than a refusal because a reader cannot tell them apart.
+        Extracted because it was in two places and they had already diverged:
+        the streaming endpoint did its own retrieval and so skipped live search
+        and the per-paper cap entirely. A reader streaming an answer got
+        different evidence from one waiting for it, with nothing to indicate
+        which they were reading.
         """
         evidence, retrieval_ms = self.retrieve(question, doc_ids=doc_ids, session=session)
-        provider = self.provider(provider_name)
 
-        # Whether to reach outside the corpus is decided from what the corpus
-        # actually holds, not from a flag someone has to remember to set. A
-        # question asking what a field is doing *now*, answered from a fixed
-        # corpus, is the failure that looks most like success — real citations,
+        # Whether to reach outside the corpus is decided from the shape of the
+        # question, not from a flag someone has to remember to set. A question
+        # asking what a field is doing *now*, answered from a fixed corpus, is
+        # the failure that looks most like success — real citations,
         # eight-year-old evidence, no indication of either.
         if live is None:
             # Never when a subset is chosen. Asking "what does this paper say"
@@ -514,13 +547,35 @@ class Engine:
         # reader has *chosen* the papers, the cap is the opposite of what they
         # asked for: selecting a single paper and receiving three passages from
         # it is a worse answer than the corpus could give, and the refusal that
-        # followed looked like the paper had nothing to say.
-        # _merge_uploaded has already given the reader's own papers their
-        # slots; capping again here would take them straight back.
+        # followed looked like the paper had nothing to say. _merge_uploaded
+        # has already given a reader's own papers their slots, so capping again
+        # here would take them straight back.
         if not (doc_ids or self.uploaded_documents(session)):
             evidence = self._diversify(evidence, per_doc=3, limit=SERVING.top_k)
         else:
             evidence = evidence[: SERVING.top_k]
+        return evidence, retrieval_ms
+
+    async def ask(
+        self,
+        question: str,
+        provider_name: str = "local",
+        history=None,
+        live: bool | None = None,
+        doc_ids: set[str] | None = None,
+        session: str | None = None,
+    ) -> Answer:
+        """Retrieve, generate, then check what came back.
+
+        The order matters. Retrieval happens first and, when it returns
+        nothing, the model is never called — a model asked a question with no
+        context answers from its training, fluently, and a fluent unsourced
+        answer is worse than a refusal because a reader cannot tell them apart.
+        """
+        evidence, retrieval_ms = await self.evidence_for(
+            question, live=live, doc_ids=doc_ids, session=session
+        )
+        provider = self.provider(provider_name)
 
         if not evidence:
             return Answer(
@@ -547,3 +602,68 @@ class Engine:
             model=provider.model, provider=provider.name,
             retrieval_ms=retrieval_ms, generation_ms=generation_ms,
         )
+
+    async def ask_stream(
+        self,
+        question: str,
+        provider_name: str = "local",
+        history=None,
+        live: bool | None = None,
+        doc_ids: set[str] | None = None,
+        session: str | None = None,
+    ):
+        """The same answer, yielded as it is written.
+
+        Emits tagged events — ``("status", dict)``, ``("token", str)``,
+        ``("done", Answer)``, ``("error", str)`` — so the HTTP endpoint can map
+        them to server-sent events and the UI can map them to widgets without
+        either owning the sequence.
+
+        Citations are resolved only at the end, because a marker cannot be
+        checked against the evidence until it has been written. The text
+        streams; the evidence arrives once, complete, and an answer whose every
+        marker was invented becomes a refusal even though the reader has
+        already watched it appear. That is the right trade: a retraction is
+        recoverable, an unsupported claim presented as sourced is not.
+        """
+        evidence, retrieval_ms = await self.evidence_for(
+            question, live=live, doc_ids=doc_ids, session=session
+        )
+        provider = self.provider(provider_name)
+
+        if not evidence:
+            yield ("done", Answer(
+                question=question, text=NO_EVIDENCE, citations=[],
+                model=provider.model, provider=provider.name,
+                retrieval_ms=retrieval_ms, generation_ms=0.0,
+            ))
+            return
+
+        yield ("status", {
+            "retrieval_ms": retrieval_ms,
+            "passages": len(evidence),
+            "papers": len({r.chunk.doc_id for r in evidence}),
+            "evidence": evidence,
+        })
+
+        started = time.perf_counter()
+        buf: list[str] = []
+        try:
+            async for piece in provider.stream(
+                GenerationRequest(question=question, evidence=evidence, history=history)
+            ):
+                buf.append(piece)
+                yield ("token", piece)
+        except Exception as e:  # noqa: BLE001
+            yield ("error", f"the {provider_name} model stopped: {e}")
+            return
+        generation_ms = (time.perf_counter() - started) * 1000.0
+
+        text, citations = resolve("".join(buf), evidence)
+        if not is_grounded(text, citations):
+            text, citations = NO_EVIDENCE, []
+        yield ("done", Answer(
+            question=question, text=text, citations=citations,
+            model=provider.model, provider=provider.name,
+            retrieval_ms=retrieval_ms, generation_ms=generation_ms,
+        ))

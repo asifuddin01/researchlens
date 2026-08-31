@@ -44,11 +44,8 @@ import gradio as gr  # noqa: E402
 from researchlens.config import Settings  # noqa: E402
 from researchlens.engine import Engine  # noqa: E402
 from researchlens.generate.citations import is_grounded, resolve  # noqa: E402
-from researchlens.generate.prompt import (  # noqa: E402
-    NO_EVIDENCE,
-    asks_for_a_survey as _asks_for_survey,
-    build_prompt,
-)
+from researchlens.generate.prompt import NO_EVIDENCE, build_prompt  # noqa: E402
+from researchlens.generate.provider import GenerationRequest  # noqa: E402
 from researchlens.live.arxiv import is_live  # noqa: E402
 from researchlens.uploads import (  # noqa: E402
     MAX_PAPERS_PER_SESSION,
@@ -151,6 +148,44 @@ def _generate_on_gpu(system: str, user: str, max_tokens: int = 500) -> str:
     return out[0]["generated_text"].strip()
 
 
+def _stream_on_gpu(system: str, user: str, max_tokens: int = 500):
+    """Generation on the attached GPU, yielded token by token.
+
+    A ZeroGPU allocation covers a generator for as long as it is being drawn
+    from, so streaming inside the window is allowed. `TextIteratorStreamer`
+    needs the model running on another thread while this one drains the queue —
+    the standard transformers arrangement, and the reason `pipe` is called in a
+    thread rather than awaited.
+
+    The caller falls back to the blocking path if this raises. Streaming is a
+    presentation improvement; being unable to answer at all is not a trade
+    worth making for it.
+    """
+    import threading
+
+    from transformers import TextIteratorStreamer
+
+    pipe = _load_gpu_model()
+    streamer = TextIteratorStreamer(
+        pipe.tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user}]
+    worker = threading.Thread(
+        target=pipe,
+        args=(messages,),
+        kwargs={
+            "max_new_tokens": max_tokens, "do_sample": True, "temperature": 0.2,
+            "return_full_text": False, "streamer": streamer,
+        },
+        daemon=True,
+    )
+    worker.start()
+    for piece in streamer:
+        yield piece
+    worker.join(timeout=5)
+
+
 if ON_ZERO_GPU:
     # 60 seconds, not the 180 first tried. ZeroGPU pads the request — asking
     # for 180 was rejected as "the requested GPU duration (270s) is larger than
@@ -161,6 +196,7 @@ if ON_ZERO_GPU:
     # what happens inside the window is a load from local storage and a few
     # hundred tokens of generation, not a 6 GB download.
     _generate_on_gpu = spaces.GPU(duration=60)(_generate_on_gpu)
+    _stream_on_gpu = spaces.GPU(duration=60)(_stream_on_gpu)
     _prefetch_model()
 
 
@@ -189,48 +225,24 @@ def _evidence_markdown(citations, mine: set[str] | None = None) -> str:
     return "\n".join(rows)
 
 
-def _ask_on_gpu(
-    question: str, doc_ids: set[str] | None = None, session: str | None = None
-) -> tuple[str, str, str]:
-    """Retrieve with the engine, generate on the attached GPU, then check.
+def _stream_from_gpu(question, evidence, history):
+    """Generate on the attached GPU, yielding text as it arrives.
 
     Retrieval and grounding are the engine's, unchanged — only the call that
     produces text differs. The rules that make an answer trustworthy live
-    downstream of the model and apply here identically: the model is never
+    downstream of the model and apply identically here: the model is never
     invoked without evidence, markers are resolved against the passages that
     were actually retrieved, an invented one is removed, and an answer left
     with nothing supported becomes a refusal.
     """
-    started = time.perf_counter()
-    evidence, retrieval_ms = ENGINE.retrieve(question, doc_ids=doc_ids, session=session)
-    mine = {d.doc_id for d in ENGINE.uploaded_documents(session)}
-
-    # Not when a subset is chosen: a reader who picked two papers has said the
-    # rest of the literature is not what they want. Not when they have uploaded
-    # a paper either — they came to ask about that.
-    if not doc_ids and not mine and question and _asks_for_survey(question):
-        fetched = asyncio.run(ENGINE.live_evidence(question))
-        if fetched:
-            evidence = ENGINE._merge_live(question, fetched, evidence)
-
-    if not evidence:
-        return NO_EVIDENCE, "", f"retrieval {retrieval_ms:.0f} ms"
-
-    system, user = build_prompt(question, evidence)
-    gen_started = time.perf_counter()
-    raw = _generate_on_gpu(system, user)
-    generation_ms = (time.perf_counter() - gen_started) * 1000.0
-
-    text, citations = resolve(raw, evidence)
-    if not is_grounded(text, citations):
-        text, citations = NO_EVIDENCE, []
-
-    timing = (
-        f"{GPU_MODEL} on ZeroGPU · retrieval {retrieval_ms:.0f} ms "
-        f"· generation {generation_ms:.0f} ms"
-    )
-    _ = time.perf_counter() - started
-    return text, _evidence_markdown(citations, mine), timing
+    system, user = build_prompt(question, evidence, history)
+    try:
+        yield from _stream_on_gpu(system, user)
+    except Exception as e:  # noqa: BLE001
+        # Streaming is presentation. Losing it should cost the reader a
+        # progress bar, not an answer.
+        print(f"  GPU streaming failed, falling back to one call: {e}", flush=True)
+        yield _generate_on_gpu(system, user)
 
 
 #: Paper label -> doc_id, for the selector. Titles are truncated because a few
@@ -254,95 +266,167 @@ def _paper_choices(session: str | None) -> list[tuple[str, str]]:
     return mine + PAPER_CHOICES
 
 
-def upload(
-    files, session: str | None, progress=gr.Progress()
-) -> tuple[str, str, dict]:
-    """Index the reader's PDFs into a session of their own.
-
-    Nothing is written to disk and nothing joins the corpus — the papers live
-    in this browser session and are dropped when it goes idle. That is stated
-    in the UI rather than buried here, because a reader handing over an
-    unpublished manuscript is owed the answer to "where does this go".
-    """
-    session = session or secrets.token_urlsafe(16)
-    if not files:
-        return session, "", gr.update()
-
-    added, failed = [], []
-    for i, f in enumerate(files):
-        path = Path(getattr(f, "name", f))
-        # Indexing a sixteen-page paper is about seven seconds on a laptop and
-        # longer on this Space's CPU: parse, chunk, then embed every passage.
-        # Without a progress line that reads as a page that has stopped
-        # working, and the reader uploads it again.
-        progress(i / max(len(files), 1), desc=f"Reading {path.name}…")
-        try:
-            doc = ENGINE.add_upload(session, path.read_bytes(), path.name)
-            added.append(f"**{doc.title or path.name}** — {doc.n_pages} pages")
-        except UploadError as e:
-            failed.append(f"{path.name}: {e}")
-        except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
-            failed.append(f"{path.name}: could not be read ({e})")
-
-    lines = []
-    if added:
-        lines.append("Indexed " + "; ".join(added) + ".")
-        lines.append(
-            "Ask anything — your papers get guaranteed room in the evidence, "
-            "or pick them in the selector to read them alone."
-        )
-    for msg in failed:
-        lines.append(f"\u26a0 {msg}")
-    open_now = len(ENGINE.uploaded_documents(session))
-    if open_now:
-        lines.append(
-            f"<sub>{open_now}/{MAX_PAPERS_PER_SESSION} open · held in memory for "
-            "this session only, never added to the public corpus, never written "
-            "to disk.</sub>"
-        )
-    return session, "\n\n".join(lines), gr.update(choices=_paper_choices(session))
-
-
-def forget(session: str | None) -> tuple[str, str, dict, None]:
+def forget(session: str | None) -> tuple[str, str, dict]:
     """Drop this reader's papers now rather than at the timeout."""
     if session:
         ENGINE.drop_uploads(session)
-    return session, "Your papers have been dropped.", gr.update(
-        choices=_paper_choices(None), value=[]
-    ), None
+    return (
+        session,
+        "Your papers have been dropped.",
+        gr.update(choices=_paper_choices(None), value=[]),
+    )
 
 
-def ask(
-    question: str,
-    provider: str,
-    papers: list[str] | None = None,
-    session: str | None = None,
-) -> tuple[str, str, str]:
-    question = (question or "").strip()
+def _pairs(messages, limit: int = 1):
+    """The last few (question, answer) turns, for pronoun resolution only.
+
+    Deliberately short. The prompt carries this so "what about the second one"
+    can be understood, not so the model can answer from what it said earlier —
+    an answer built on a previous answer is an answer with no passage behind
+    it, which is the one thing this system exists to prevent.
+    """
+    out, pending = [], None
+    for m in messages or []:
+        role = m.get("role") if isinstance(m, dict) else None
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, str):
+            # A multimodal turn's content is a file tuple, not text. It carries
+            # no question to resolve a pronoun against.
+            continue
+        if role == "user":
+            pending = content
+        elif role == "assistant" and pending is not None:
+            out.append((pending, content))
+            pending = None
+    return out[-limit:]
+
+
+def _sync_stream(question, evidence, history, provider_name):
+    """Drain an async provider stream from synchronous Gradio code.
+
+    Gradio's handler is a plain generator and the providers are async. Running
+    the coroutine to completion first would defeat the point, so the loop is
+    stepped one chunk at a time and each is handed back as it lands.
+    """
+    provider = ENGINE.provider(provider_name)
+    req = GenerationRequest(question=question, evidence=evidence, history=history)
+    loop = asyncio.new_event_loop()
+    try:
+        agen = provider.stream(req).__aiter__()
+        while True:
+            try:
+                yield loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                return
+    finally:
+        loop.close()
+
+
+def respond(message, history, provider, papers, live_mode, session):
+    """One conversational turn: ingest anything attached, then answer.
+
+    A generator, so the reader watches retrieval finish and the answer being
+    written rather than a spinner and a wall of text. Yields
+    (reply, evidence, timing, session, paper choices) throughout.
+    """
+    session = session or secrets.token_urlsafe(16)
+    files = list((message or {}).get("files") or [])
+    question = ((message or {}).get("text") or "").strip()
+    choices = gr.update()
+
+    # ---- anything dropped into the box is a paper to read ----------------
+    notes: list[str] = []
+    if files:
+        yield (f"_Reading {len(files)} file(s)…_", "", "", session, choices)
+        for f in files:
+            path = Path(getattr(f, "name", f))
+            try:
+                doc = ENGINE.add_upload(session, path.read_bytes(), path.name)
+                notes.append(f"Indexed **{doc.title or path.name}** — {doc.n_pages} pages.")
+            except UploadError as e:
+                notes.append(f"\u26a0 {path.name}: {e}")
+            except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
+                notes.append(f"\u26a0 {path.name}: could not be read ({e})")
+        choices = gr.update(choices=_paper_choices(session))
+        open_now = len(ENGINE.uploaded_documents(session))
+        if open_now:
+            notes.append(
+                f"<sub>{open_now}/{MAX_PAPERS_PER_SESSION} of your papers open · "
+                "held in memory for this session only, never added to the public "
+                "corpus, never written to disk.</sub>"
+            )
+        if not question:
+            # Papers with no question: say what was read and stop. Inventing a
+            # question to answer would be answering something nobody asked.
+            yield ("\n\n".join(notes) + "\n\nAsk me about them.", "", "", session, choices)
+            return
+
     if len(question) < 3:
-        return "Ask a question about the indexed papers.", "", ""
+        yield ("Ask a question about the papers.", "", "", session, choices)
+        return
 
-    # An empty selection means the whole corpus, which is the common case and
-    # should not require choosing a hundred and one things.
+    preamble = ("\n\n".join(notes) + "\n\n---\n\n") if notes else ""
+    history_pairs = _pairs(history)
+    yield (preamble + "_searching the papers…_", "", "", session, choices)
+
     doc_ids = set(papers) if papers else None
+    live = {"auto": None, "always": True, "never": False}[live_mode]
+    mine = {d.doc_id for d in ENGINE.uploaded_documents(session)}
 
     try:
-        if provider == "gpu":
-            return _ask_on_gpu(question, doc_ids, session)
-        answer = asyncio.run(
-            ENGINE.ask(question, provider, doc_ids=doc_ids, session=session)
+        evidence, retrieval_ms = asyncio.run(
+            ENGINE.evidence_for(question, live=live, doc_ids=doc_ids, session=session)
         )
-    except ValueError as e:
-        return f"**{e}**", "", ""
-    except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
-        return f"The model did not answer: {e}", "", ""
+    except Exception as e:  # noqa: BLE001
+        yield (preamble + f"Retrieval failed: {e}", "", "", session, choices)
+        return
 
-    timing = (
-        f"{answer.model} · retrieval {answer.retrieval_ms:.0f} ms "
-        f"· generation {answer.generation_ms:.0f} ms"
+    if not evidence:
+        yield (preamble + NO_EVIDENCE, "",
+               f"retrieval {retrieval_ms:.0f} ms · no passages", session, choices)
+        return
+
+    n_live = sum(1 for r in evidence if is_live(r.chunk.chunk_id))
+    n_mine = sum(1 for r in evidence if r.chunk.doc_id in mine)
+    found = (
+        f"{len(evidence)} passages from {len({r.chunk.doc_id for r in evidence})} papers"
+        + (f" · {n_live} live" if n_live else "")
+        + (f" · {n_mine} yours" if n_mine else "")
     )
-    mine = {d.doc_id for d in ENGINE.uploaded_documents(session)}
-    return answer.text, _evidence_markdown(answer.citations, mine), timing
+    status = f"retrieval {retrieval_ms:.0f} ms · {found}"
+    yield (preamble + f"_{found} — writing the answer…_", "", status, session, choices)
+
+    started = time.perf_counter()
+    buf: list[str] = []
+    try:
+        pieces = (
+            _stream_from_gpu(question, evidence, history_pairs)
+            if provider == "gpu"
+            else _sync_stream(question, evidence, history_pairs, provider)
+        )
+        for piece in pieces:
+            buf.append(piece)
+            # Streamed straight through. Markers are resolved only at the end,
+            # so text shown mid-flight may contain one that does not survive —
+            # the alternative is a blank box for twenty seconds, and the final
+            # replacement is what the reader keeps.
+            yield (preamble + "".join(buf), "", status, session, choices)
+    except Exception as e:  # noqa: BLE001
+        yield (preamble + f"The model did not answer: {e}", "", status, session, choices)
+        return
+    generation_ms = (time.perf_counter() - started) * 1000.0
+
+    text, citations = resolve("".join(buf), evidence)
+    if not is_grounded(text, citations):
+        # Every marker was invented, or none was produced. The reader has
+        # already watched the text appear and it is still replaced: a
+        # retraction is recoverable, an unsupported claim shown as sourced is
+        # not.
+        text, citations = NO_EVIDENCE, []
+
+    model = GPU_MODEL if provider == "gpu" else ENGINE.provider(provider).model
+    timing = f"{model} · retrieval {retrieval_ms:.0f} ms · generation {generation_ms:.0f} ms · {found}"
+    yield (preamble + text, _evidence_markdown(citations, mine), timing, session, choices)
 
 
 # On ZeroGPU the attached GPU is the best option and needs no key, so it leads.
@@ -359,93 +443,112 @@ with gr.Blocks(title="ResearchLens", theme=gr.themes.Soft()) as demo:
         f"""
 # ResearchLens
 
-Evidence-grounded retrieval over **{len(ENGINE.documents)} papers**
-({len(ENGINE.chunks):,} passages) in single-cell genomics, causal discovery,
-vision-language models and retrieval-augmented generation.
+Ask across **{len(ENGINE.documents)} papers** ({len(ENGINE.chunks):,} passages)
+in single-cell genomics, causal discovery, vision-language models and
+retrieval-augmented generation — or attach your own PDF and ask about that.
 
-Every claim resolves to a passage — a paper, a section, a page. Questions about
-what is *current* also search arXiv and PubMed; those results are marked
-**live** and are abstracts, not full text.
+It answers only from evidence. Every claim resolves to a passage: a paper, a
+section, a page. When nothing supports an answer it says so instead of writing
+one. Questions about what is *current* also search arXiv, PubMed and OpenAlex;
+those are marked **live** and are abstracts, not full text.
 
-This is a read-only exhibit of a system that runs locally with no API key —
+Runs locally with no API key —
 [github.com/asifuddin01/researchlens](https://github.com/asifuddin01/researchlens).
 """
     )
 
-    with gr.Row():
-        question = gr.Textbox(
-            label="Your question",
-            placeholder="What does the literature say about…",
-            # Without an explicit height a Textbox expands to fill its row,
-            # which left a question box taller than the answer beneath it.
-            lines=2,
-            max_lines=4,
-            scale=5,
-        )
-        provider = gr.Radio(
-            choices=PROVIDERS,
-            value=PROVIDERS[0] if PROVIDERS else None,
-            label="Model",
-            scale=1,
-        )
+    # Built with render=False and rendered below by hand, so the evidence sits
+    # under the conversation and the controls under that. ChatInterface renders
+    # anything it is handed that has not been rendered already, which would put
+    # all of it above the chat.
+    session = gr.State(value=None)
+    evidence_box = gr.Markdown(render=False)
+    timing_box = gr.Markdown(render=False)
     papers = gr.Dropdown(
         choices=PAPER_CHOICES,
         value=[],
         multiselect=True,
         label=f"Papers (leave empty to search all {len(ENGINE.documents)})",
         info="Pick one or more to confine the answer to them.",
+        render=False,
     )
-    submit = gr.Button("Ask", variant="primary")
+    provider = gr.Radio(
+        choices=PROVIDERS,
+        value=PROVIDERS[0] if PROVIDERS else None,
+        label="Model",
+        render=False,
+    )
+    live_mode = gr.Radio(
+        choices=["auto", "always", "never"],
+        value="auto",
+        label="Search arXiv, PubMed and OpenAlex",
+        info="auto: only when the question asks what a field is doing now — a "
+             "fixed corpus cannot answer that.",
+        render=False,
+    )
 
-    # A session id, held per browser tab by Gradio. It is the only thing
-    # separating one reader's uploaded papers from another's, so it is
-    # generated here rather than accepted from anywhere.
-    session = gr.State(value=None)
+    # gr.ChatInterface rather than a Chatbot wired up by hand: it brings stop,
+    # retry, undo and message editing, none of which is worth reimplementing,
+    # and it is the component Gradio actually maintains for this shape of app.
+    #
+    # A note against a wasted hour: synthetic Enter keystrokes from browser
+    # automation do not submit this box, and neither did the hand-wired
+    # Textbox before it. Two components failing the same way points at the
+    # instrument, not at Gradio — dispatched key events reach the DOM but not
+    # Svelte's handler. Click the send button when driving this from a script.
+    #
+    # multimodal=True puts the file picker inside the message box, which is the
+    # right place for it: attaching a paper and asking about it is one action,
+    # not a trip to a separate upload panel.
+    gr.ChatInterface(
+        fn=respond,
+        multimodal=True,
+        textbox=gr.MultimodalTextbox(
+            placeholder="Ask about the papers, or attach a PDF and ask about that…",
+            file_types=[".pdf"],
+            file_count="multiple",
+            show_label=False,
+            autofocus=True,
+        ),
+        chatbot=gr.Chatbot(
+            height=460,
+            label="Conversation",
+            placeholder="Ask about the indexed papers, or attach your own.",
+            render=False,
+        ),
+        additional_inputs=[provider, papers, live_mode, session],
+        # ChatInterface renders the additional inputs itself, in this
+        # accordion. Rendering them again below raises DuplicateBlockError —
+        # a component belongs to exactly one place in the layout.
+        additional_inputs_accordion=gr.Accordion("Scope and model", open=False),
+        additional_outputs=[evidence_box, timing_box, session, papers],
+        examples=[[{"text": q, "files": []}] for q in EXAMPLES],
+        editable=True,
+        save_history=False,
+    )
 
-    with gr.Accordion("Add your own papers", open=False):
+    timing_box.render()
+    with gr.Accordion("Evidence", open=True):
+        evidence_box.render()
+
+    with gr.Accordion("Your own papers", open=False):
         gr.Markdown(
             f"""
-Drop in up to **{MAX_PAPERS_PER_SESSION} PDFs** and ask about them — on their
-own, or against the {len(ENGINE.documents)} indexed papers.
+**Your own papers.** Attach up to **{MAX_PAPERS_PER_SESSION} PDFs** in the
+message box and ask about them — alone, or against the
+{len(ENGINE.documents)} indexed ones.
 
 They are parsed, chunked and embedded in memory for **your session only**.
-Nothing is written to disk, nothing is added to the public corpus, and nothing
-is visible to anyone else. An idle session is dropped after an hour.
+Nothing is written to disk, nothing joins the public corpus, nothing is visible
+to anyone else, and an idle session is dropped after an hour.
 
-Text PDFs only: a scan has no text layer to retrieve, and the parser will say so
-rather than index a paper that can never be found.
+Text PDFs only: a scan has no text layer to retrieve, and the parser says so
+rather than indexing a paper that can never be found.
 """
         )
-        uploader = gr.File(
-            label="PDFs",
-            file_count="multiple",
-            file_types=[".pdf"],
-            height=140,
-        )
-        upload_status = gr.Markdown()
-        clear_uploads = gr.Button("Forget my papers", size="sm")
-
-    answer_box = gr.Markdown(label="Answer")
-    timing_box = gr.Markdown()
-    # Collapsed by default. The evidence is the point, but it is long, and a
-    # reader who wants the answer should not have to scroll past five quoted
-    # passages to find out whether there was one.
-    with gr.Accordion("Evidence", open=True):
-        evidence_box = gr.Markdown()
-
-    gr.Examples(examples=[[q] for q in EXAMPLES], inputs=[question])
-
-    inputs = [question, provider, papers, session]
-    outputs = [answer_box, evidence_box, timing_box]
-    submit.click(ask, inputs, outputs)
-    question.submit(ask, inputs, outputs)
-
-    uploader.upload(
-        upload, [uploader, session], [session, upload_status, papers]
-    )
-    clear_uploads.click(
-        forget, [session], [session, upload_status, papers, uploader]
-    )
+        forget_btn = gr.Button("Forget my papers", size="sm")
+        forget_note = gr.Markdown()
+        forget_btn.click(forget, [session], [session, forget_note, papers])
 
 
 # No custom /health here, deliberately. Gradio builds its FastAPI app inside

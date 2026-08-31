@@ -26,9 +26,6 @@ from pydantic import BaseModel, Field
 
 from researchlens.config import Settings
 from researchlens.engine import Engine
-from researchlens.generate.citations import is_grounded, resolve
-from researchlens.generate.prompt import NO_EVIDENCE
-from researchlens.generate.provider import GenerationRequest
 from researchlens.uploads import MAX_BYTES, UploadError
 
 
@@ -195,81 +192,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail=f"the {req.provider} model did not answer: {e}"
             ) from e
-        return {
-            "question": answer.question,
-            "text": answer.text,
-            "provider": answer.provider,
-            "model": answer.model,
-            "retrieval_ms": round(answer.retrieval_ms, 1),
-            "generation_ms": round(answer.generation_ms, 1),
-            "citations": [
-                {
-                    "marker": c.marker,
-                    "chunk_id": c.chunk_id,
-                    "doc_title": c.doc_title,
-                    "section_heading": c.section_heading,
-                    "pages": c.pages,
-                    "quote": c.quote,
-                }
-                for c in answer.citations
-            ],
-        }
+        return _answer_json(answer)
 
     @app.post("/ask/stream")
     async def ask_stream(req: AskRequest):
         """The same answer, as server-sent events.
 
-        Citations are resolved only once generation completes, because a marker
-        cannot be checked against the evidence until it has been written. The
-        text streams; the evidence arrives at the end, in one event.
+        A thin mapping over `Engine.ask_stream` rather than its own retrieval.
+        This endpoint used to do its own, and had silently drifted: it skipped
+        live search and the per-paper cap, so a streamed answer was built from
+        different evidence than a waited-for one, with nothing to say which was
+        which.
         """
-        evidence, retrieval_ms = engine.retrieve(
-            req.question,
-            doc_ids=set(req.doc_ids) if req.doc_ids else None,
-            session=req.session,
-        )
-        try:
-            provider = engine.provider(req.provider)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-
         async def events():
-            if not evidence:
-                yield _sse("answer", {"text": NO_EVIDENCE})
-                yield _sse("done", {"citations": [], "retrieval_ms": round(retrieval_ms, 1)})
-                return
-
-            yield _sse("status", {"retrieval_ms": round(retrieval_ms, 1),
-                                  "passages": len(evidence)})
-            buf: list[str] = []
             try:
-                async for piece in provider.stream(
-                    GenerationRequest(question=req.question, evidence=evidence)
-                ):
-                    buf.append(piece)
-                    yield _sse("token", {"t": piece})
-            except Exception as e:
-                yield _sse("error", {"detail": f"the {req.provider} model stopped: {e}"})
+                stream = engine.ask_stream(
+                    req.question,
+                    req.provider,
+                    doc_ids=set(req.doc_ids) if req.doc_ids else None,
+                    session=req.session,
+                )
+            except ValueError as e:
+                yield _sse("error", {"detail": str(e)})
                 return
-
-            text, citations = resolve("".join(buf), evidence)
-            if not is_grounded(text, citations):
-                text, citations = NO_EVIDENCE, []
-            yield _sse(
-                "done",
-                {
-                    "text": text,
-                    "retrieval_ms": round(retrieval_ms, 1),
-                    "citations": [
-                        {
-                            "marker": c.marker, "chunk_id": c.chunk_id,
-                            "doc_title": c.doc_title, "section_heading": c.section_heading,
-                            "pages": c.pages, "quote": c.quote,
-                        }
-                        for c in citations
-                    ],
-                },
-            )
+            try:
+                async for kind, payload in stream:
+                    if kind == "status":
+                        yield _sse("status", {
+                            "retrieval_ms": round(payload["retrieval_ms"], 1),
+                            "passages": payload["passages"],
+                            "papers": payload["papers"],
+                        })
+                    elif kind == "token":
+                        yield _sse("token", {"t": payload})
+                    elif kind == "error":
+                        yield _sse("error", {"detail": payload})
+                    elif kind == "done":
+                        yield _sse("done", _answer_json(payload))
+            except ValueError as e:
+                yield _sse("error", {"detail": str(e)})
 
         return StreamingResponse(
             events(),
@@ -354,6 +315,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 #: Same shape the request models enforce, for the endpoints that take a
 #: session in the path or as form data, where pydantic is not doing it.
 _SESSION_OK = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def _answer_json(answer) -> dict:
+    """One shape for an answer, so the streaming and waiting endpoints cannot
+    describe the same result differently."""
+    return {
+        "question": answer.question,
+        "text": answer.text,
+        "provider": answer.provider,
+        "model": answer.model,
+        "retrieval_ms": round(answer.retrieval_ms, 1),
+        "generation_ms": round(answer.generation_ms, 1),
+        "citations": [
+            {
+                "marker": c.marker,
+                "chunk_id": c.chunk_id,
+                "doc_title": c.doc_title,
+                "section_heading": c.section_heading,
+                "pages": c.pages,
+                "quote": c.quote,
+            }
+            for c in answer.citations
+        ],
+    }
 
 
 def _sse(event: str, data: dict) -> str:

@@ -111,9 +111,36 @@ async def main_async(args) -> int:
     # --- live search ----------------------------------------------------
     if not args.no_live:
         live_q = "What are the current trends in long-context language models?"
+
+        # Two checks, because the old single one conflated them and then
+        # blamed the wrong component. It asserted that the *answer* cited a
+        # live passage, and reported "live search reaches arXiv — 0 live
+        # citations" on a run where live search had worked perfectly and
+        # fetched four passages from three indexes: the model had simply
+        # declined to answer from them. Whether live search works is a fact
+        # about retrieval; whether the model cites what it is given is a fact
+        # about the model, and only the first is this system's to guarantee.
+        evidence, _ms = await engine.evidence_for(live_q)
+        reached = [r for r in evidence if is_live(r.chunk.chunk_id)]
+        sources = sorted({r.chunk.chunk_id.split(":")[0] for r in reached})
+        check(
+            "live search reaches the prompt",
+            bool(reached),
+            f"{len(reached)} live passages from {sources or 'nothing'}"
+            + (f" — {engine.last_live_error}" if engine.last_live_error else ""),
+        )
+
         live = await engine.ask(live_q, args.provider)
         used = [c for c in live.citations if is_live(c.chunk_id)]
-        check("live search reaches arXiv", bool(used), f"{len(used)} live citations")
+        check(
+            "the answer cites live evidence",
+            bool(used),
+            f"{len(used)} live citations",
+            # The model's choice, not the pipeline's. A small model declining
+            # to answer from thin evidence is the behaviour this project wants;
+            # failing the build for it would train us to want the opposite.
+            fatal=False,
+        )
         check(
             "live citations are marked as abstracts",
             all(c.pages == "abstract" for c in used),

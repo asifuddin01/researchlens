@@ -167,3 +167,83 @@ def test_only_so_many_sessions_are_kept():
     live = [w for w in ("a", "b", "c") if s.documents(w)]
     assert len(live) == 2
     assert "c" in live, "the newest session must survive"
+
+
+# ---- reserved slots --------------------------------------------------------
+
+class StubReranker:
+    """Scores by a table, so a merge decision is decidable by eye."""
+
+    def __init__(self, scores):
+        self.scores = scores
+
+    def rerank(self, _query, chunks, k):
+        ranked = sorted(
+            ((c.chunk_id, self.scores.get(c.chunk_id, 0.0)) for c in chunks),
+            key=lambda t: -t[1],
+        )
+        return ranked[:k]
+
+
+def _hit(chunk_id: str, doc: str):
+    from researchlens.types import Chunk, Retrieved
+
+    return Retrieved(
+        chunk=Chunk(chunk_id=chunk_id, doc_id=doc, ordinal=0, text="t",
+                    section_kind="abstract", section_heading="h",
+                    page_start=0, page_end=0, doc_title=doc),
+        score=0.0,
+    )
+
+
+def _engine_with(reranker):
+    from researchlens.config import Settings
+    from researchlens.engine import Engine
+    from researchlens.retrieval.pipeline import RetrievalPipeline
+
+    e = Engine(Settings())
+    e.pipeline = RetrievalPipeline(reranker=reranker)
+    return e
+
+
+def test_an_irrelevant_live_result_does_not_keep_its_reserved_slot():
+    """Asked what is current in long-context language models, PubMed returned a
+    disease-management paper at -0.89 while the corpus had GPT-3 at +0.84, and
+    the reserved slot handed it half the evidence. The model then refused."""
+    e = _engine_with(StubReranker({
+        "arxiv:good": 1.24, "pubmed:offtopic": -0.89, "corpus:gpt3": 0.84,
+        "corpus:realm": -0.46,
+    }))
+    merged = e._merge_live(
+        "what is current",
+        [_hit("arxiv:good", "arxiv"), _hit("pubmed:offtopic", "pubmed")],
+        [_hit("corpus:gpt3", "d1"), _hit("corpus:realm", "d2")],
+    )
+    ids = [r.chunk.chunk_id for r in merged]
+    assert "arxiv:good" in ids
+    assert "pubmed:offtopic" not in ids
+
+
+def test_live_evidence_survives_when_everything_scores_badly():
+    """On 'open problems in AI for radiology' every passage scored negative and
+    the live ones were still the right answer, so the floor is relative to the
+    best alternative rather than absolute."""
+    e = _engine_with(StubReranker({
+        "openalex:a": -1.16, "openalex:b": -1.48, "corpus:x": -0.97,
+    }))
+    merged = e._merge_live(
+        "what is current",
+        [_hit("openalex:a", "oa1"), _hit("openalex:b", "oa2")],
+        [_hit("corpus:x", "d1")],
+    )
+    assert "openalex:a" in [r.chunk.chunk_id for r in merged]
+
+
+def test_an_uploaded_paper_keeps_its_slot_however_it_scores():
+    """A reader who uploaded a paper has said it is the thing they want read;
+    the cross-encoder being unimpressed is not grounds to overrule them."""
+    e = _engine_with(StubReranker({"up:1": -9.0, "corpus:x": 5.0}))
+    merged = e._merge_uploaded(
+        "q", [_hit("up:1", "mine")], [_hit("corpus:x", "d1")], k=8
+    )
+    assert "up:1" in [r.chunk.chunk_id for r in merged]

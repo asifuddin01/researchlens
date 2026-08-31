@@ -163,3 +163,55 @@ def test_a_live_chunk_names_its_index_and_cannot_pass_as_a_page():
     assert is_live(c.chunk_id)
     assert c.pages == "abstract"
     assert "OpenAlex" in c.section_heading
+
+
+# ---- the survey instruction must describe the evidence it is sent with -----
+
+def _retrieved(chunk_id: str, title: str, text: str = "Some findings."):
+    from researchlens.types import Chunk, Retrieved
+
+    doc = chunk_id.split(":")[0] if ":" in chunk_id else chunk_id.split("-")[0]
+    return Retrieved(
+        chunk=Chunk(
+            chunk_id=chunk_id, doc_id=doc, ordinal=0, text=text,
+            section_kind="abstract", section_heading="h",
+            page_start=0, page_end=0, doc_title=title,
+        ),
+        score=1.0,
+    )
+
+
+def test_a_survey_question_with_live_evidence_is_told_the_evidence_is_recent():
+    """The instruction went stale the day live search landed: it told the model
+    its evidence was a fixed corpus even when abstracts had been fetched
+    minutes earlier, and the model duly refused with three of them in hand."""
+    from researchlens.generate.prompt import build_prompt
+
+    _system, user = build_prompt(
+        "What are the current trends in long-context language models?",
+        [_retrieved("arxiv:2608.1", "A Recent Paper"),
+         _retrieved("abc123:4", "An Indexed Paper")],
+    )
+    assert "fetched" in user
+    assert "fixed set of indexed papers rather than a survey" not in user
+
+
+def test_a_survey_question_without_live_evidence_still_says_the_corpus_is_fixed():
+    from researchlens.generate.prompt import build_prompt
+
+    _system, user = build_prompt(
+        "What are the current trends in long-context language models?",
+        [_retrieved("abc123:4", "An Indexed Paper")],
+    )
+    assert "fixed set of indexed papers" in user
+    assert "fetched" not in user
+
+
+def test_an_ordinary_question_gets_no_survey_instruction():
+    from researchlens.generate.prompt import build_prompt
+
+    _system, user = build_prompt(
+        "What datasets does scGPT use?", [_retrieved("abc123:4", "An Indexed Paper")]
+    )
+    assert "fixed set of indexed papers" not in user
+    assert "fetched" not in user
