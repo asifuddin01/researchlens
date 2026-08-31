@@ -1,0 +1,31 @@
+# The edge in front of ResearchLens.
+#
+# Rate limiting lives here rather than in the container for one reason: saying
+# no should be free. The retrieval service scales to zero, so enforcing limits
+# in the application means waking a machine in order to refuse a request — and
+# an abusive client would keep it awake continuously.
+#
+#   npx wrangler deploy -c deploy/worker/wrangler.toml
+#   npx wrangler kv namespace create RL_LIMITS
+
+name = "researchlens-api"
+main = "index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+ORIGIN = "https://researchlens-api.fly.dev"
+ALLOWED_ORIGINS = "https://asifuddin.com,https://www.asifuddin.com"
+# Per-IP, per-hour. Generous for a reader, useless for a scraper.
+RATE_PER_HOUR = "20"
+# Whole-instance daily ceiling. The demo is a shop window, not a service, and
+# an unbounded one is a bill anyone can run up.
+DAILY_CEILING = "600"
+
+# Counters. KV is eventually consistent, which is fine here: the cost of
+# occasionally allowing one request past a limit is one request.
+[[kv_namespaces]]
+binding = "RL_LIMITS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[observability]
+enabled = true

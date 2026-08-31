@@ -1,0 +1,50 @@
+# The retrieval service: parsing already done, index bundled, API served.
+#
+# Sized to stay under 2 GB, which is the whole point. Fly can snapshot a
+# machine's memory and resume it in well under a second, but not above roughly
+# that ceiling — so this service suspends between visitors and wakes instantly,
+# while the language model (which cannot fit) scales to zero and cold-boots.
+# Splitting them is what makes a scale-to-zero demo feel alive rather than
+# broken.
+#
+#   fly launch --no-deploy --copy-config --config deploy/fly.retrieval.toml
+#   fly deploy --config deploy/fly.retrieval.toml
+
+app = "researchlens-api"
+primary_region = "sin"   # closest to Dhaka; change if you prefer
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[env]
+  RESEARCHLENS_MODE = "demo"
+  DATA_DIR = "/app/data"
+  OLLAMA_HOST = "http://researchlens-llm.flycast:11434"
+  ALLOWED_ORIGINS = "https://asifuddin.com,https://www.asifuddin.com"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_start_machines = true
+  # "suspend", not "stop": a stopped machine cold-boots and reloads two ONNX
+  # models; a suspended one resumes from a memory snapshot.
+  auto_stop_machines = "suspend"
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    # A reranking query is ~850 ms of CPU. Letting many run at once on shared
+    # CPU makes every one of them slow rather than making the service fast.
+    soft_limit = 4
+    hard_limit = 8
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "60s"   # first start loads the embedding and reranker models
+  method = "GET"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

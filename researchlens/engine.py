@@ -70,25 +70,92 @@ class Engine:
         #: Why the last live search failed, if it did. Surfaced by /health so a
         #: broken live path is visible rather than merely quiet.
         self.last_live_error: str | None = None
+        self._bundle_matrix = None
 
     # ---- startup ---------------------------------------------------------
 
     def load(self) -> None:
-        """Parse, chunk and index. Called once, before serving."""
-        data = Path(self.settings.data_dir)
-        self.documents, self.skipped = load_library(data / "pdfs", data / "index")
-        if not self.documents:
-            raise RuntimeError(f"no readable papers under {data / 'pdfs'}")
+        """Load the corpus and build the index. Called once, before serving.
 
-        self.chunks = chunk_corpus(self.documents)
+        A prebuilt bundle is used when present. That is what a deployed
+        container gets: the parser derives each document id from the PDF's
+        bytes, so parsing at startup would mean shipping ~600 MB of journal
+        PDFs in the image and answering a redistribution question this project
+        does not need to answer. Everything that serves a query is downstream
+        of parsing, and that is ~24 MB.
+        """
+        data = Path(self.settings.data_dir)
+        bundle = data / "bundle"
+
+        if (bundle / "chunks.jsonl").exists():
+            self._load_bundle(bundle)
+        else:
+            self.documents, self.skipped = load_library(data / "pdfs", data / "index")
+            if not self.documents:
+                raise RuntimeError(f"no readable papers under {data / 'pdfs'}")
+            self.chunks = chunk_corpus(self.documents)
+
         self._by_id = {c.chunk_id: c for c in self.chunks}
 
+        dense = DenseRetriever(model=self.settings.embedding_model)
+        if (matrix := getattr(self, "_bundle_matrix", None)) is not None:
+            # Hand the bundle's vectors straight in rather than re-embedding
+            # 9,540 passages at every container start.
+            dense._ids = [c.chunk_id for c in self.chunks]
+            dense._matrix = matrix
+
         self.pipeline = RetrievalPipeline(
-            dense=DenseRetriever(model=self.settings.embedding_model),
+            dense=dense,
             bm25=BM25Retriever(),
             reranker=CrossEncoderReranker(model=self.settings.reranker_model),
         )
-        self.pipeline.index(self.chunks)
+        if matrix is None:
+            self.pipeline.index(self.chunks)
+        else:
+            self.pipeline._by_id = {c.chunk_id: c for c in self.chunks}
+            self.pipeline.bm25.index(self.chunks)
+
+    def _load_bundle(self, bundle: Path) -> None:
+        """Read passages and vectors exported by scripts/export_bundle.py."""
+        import json
+
+        import numpy as np
+
+        manifest = json.loads((bundle / "manifest.json").read_text())
+        if manifest.get("embedding_model") != self.settings.embedding_model:
+            # Vectors from one model scored against queries embedded by another
+            # produce plausible nonsense, and nothing downstream would notice.
+            raise RuntimeError(
+                f"bundle was built with {manifest.get('embedding_model')!r} but this "
+                f"instance uses {self.settings.embedding_model!r}"
+            )
+
+        self.chunks = []
+        for line in (bundle / "chunks.jsonl").read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                self.chunks.append(Chunk(**json.loads(line)))
+
+        with np.load(bundle / "vectors.npz") as z:
+            matrix = z["matrix"]
+        if matrix.shape[0] != len(self.chunks):
+            raise RuntimeError(
+                f"bundle is inconsistent: {len(self.chunks)} passages but "
+                f"{matrix.shape[0]} vectors — row order is the only thing linking "
+                "them, so a mismatch would retrieve the wrong passage confidently"
+            )
+        self._bundle_matrix = matrix
+
+        # The library listing is served from the bundle too, so /library keeps
+        # working without the PDFs it was derived from.
+        seen: dict[str, str] = {}
+        for c in self.chunks:
+            seen.setdefault(c.doc_id, c.doc_title)
+        self.documents = [
+            Document(doc_id=d, title=t, authors=[], sections=[], n_pages=0,
+                     source_path="(bundled)")
+            for d, t in seen.items()
+        ]
+        self.skipped = []
 
     @property
     def ready(self) -> bool:

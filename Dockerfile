@@ -24,6 +24,14 @@ COPY researchlens/ ./researchlens/
 COPY eval/ ./eval/
 COPY scripts/ ./scripts/
 
+# The prebuilt index: passages and vectors, no PDFs. Built by
+# `python scripts/export_bundle.py` and about 24 MB, against ~600 MB for the
+# corpus it came from. The parser derives each document id from a PDF's bytes,
+# so without this the image would have to carry the papers themselves — and
+# publishing an image built from subscription journals is a question this
+# project does not need to answer. Use --open-access-only for a public image.
+COPY data/bundle/ ./data/bundle/
+
 # Runs unprivileged. The container parses PDFs supplied by whoever is using it,
 # and a parser is exactly the kind of thing that should not be root.
 RUN useradd --create-home --uid 10001 app \
@@ -33,5 +41,8 @@ USER app
 
 EXPOSE 8000
 
+# One worker. Each holds its own copy of the embedding and reranker models, so
+# a second worker doubles the memory for no throughput on shared CPU — and the
+# memory ceiling is what lets the machine suspend instead of cold-booting.
 CMD ["uvicorn", "researchlens.api.main:create_app", "--factory", \
-     "--host", "0.0.0.0", "--port", "8000"]
+     "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

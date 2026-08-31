@@ -1,0 +1,43 @@
+# The generation service.
+#
+# Separate from retrieval because a 3B model at Q4 is ~2 GB before anything
+# else loads, which is above the ceiling where a machine can be snapshotted and
+# resumed. This one therefore stops rather than suspends, and a visitor who
+# picks the local model waits about a minute for it to boot. The page says so
+# rather than showing a spinner — the wait is the thing the project is arguing
+# about, so it may as well be visible.
+#
+#   fly launch --no-deploy --copy-config --config deploy/fly.ollama.toml
+#   fly volumes create ollama_models --size 5 --region sin -a researchlens-llm
+#   fly deploy --config deploy/fly.ollama.toml
+#   fly ssh console -a researchlens-llm -C "ollama pull qwen2.5:3b-instruct"
+
+app = "researchlens-llm"
+primary_region = "sin"
+
+[build]
+  image = "ollama/ollama:latest"
+
+[env]
+  OLLAMA_HOST = "0.0.0.0:11434"
+  # Unload promptly. Holding the model resident on a machine that is about to
+  # stop anyway buys nothing and risks the OOM killer.
+  OLLAMA_KEEP_ALIVE = "5m"
+
+# Reachable only from the retrieval service over Fly's private network. There
+# is no public route to this app: an open Ollama endpoint is free inference for
+# anyone who finds it.
+[[services]]
+  internal_port = 11434
+  protocol = "tcp"
+  auto_start_machines = true
+  auto_stop_machines = "stop"
+  min_machines_running = 0
+
+[mounts]
+  source = "ollama_models"
+  destination = "/root/.ollama"
+
+[[vm]]
+  size = "shared-cpu-4x"
+  memory = "4gb"
