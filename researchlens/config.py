@@ -17,23 +17,51 @@ Mode = Literal["local", "demo"]
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Defaults live at module level, not only as field defaults.
+#
+# `Settings` is a slots dataclass, and on one of those a class attribute is a
+# member descriptor rather than the default value — `Settings.ollama_model`
+# returns `<member 'ollama_model'>`, not the string. `from_env` used those as
+# its os.getenv fallbacks, so five settings silently became descriptors
+# whenever their environment variable was unset, which is the normal case.
+# Nothing caught it because every retriever was constructed with its own
+# module default until the engine started reading Settings.
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_RERANKER_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "qwen2.5:3b-instruct"
+DEFAULT_HOSTED_MODEL = "claude-sonnet-5"
+DEFAULT_ALLOWED_ORIGINS = (
+    "http://localhost:3000",
+    "http://localhost:4321",
+    "http://localhost:8000",
+    "https://asifuddin.com",
+    "https://www.asifuddin.com",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
     mode: Mode = "local"
 
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
-    reranker_model: str = "BAAI/bge-reranker-base"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    reranker_model: str = DEFAULT_RERANKER_MODEL
 
-    ollama_host: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:3b-instruct"
+    ollama_host: str = DEFAULT_OLLAMA_HOST
+    ollama_model: str = DEFAULT_OLLAMA_MODEL
 
     #: Absent by default and absent is fine — the local provider serves.
     hosted_base_url: str | None = None
     hosted_api_key: str | None = None
-    hosted_model: str = "claude-sonnet-5"
+    hosted_model: str = DEFAULT_HOSTED_MODEL
 
     data_dir: Path = field(default_factory=lambda: ROOT / "data")
+
+    #: Origins permitted to call the API. Listed rather than wildcarded: with
+    #: "*" any third-party page could spend a metered instance's budget from a
+    #: visitor's browser. Localhost is included so the local build works with
+    #: no configuration at all.
+    allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
 
     @property
     def uploads_enabled(self) -> bool:
@@ -50,12 +78,17 @@ class Settings:
             raise ValueError(f"RESEARCHLENS_MODE must be 'local' or 'demo', got {mode!r}")
         return cls(
             mode=mode,  # type: ignore[arg-type]
-            embedding_model=os.getenv("EMBEDDING_MODEL", cls.embedding_model),
-            reranker_model=os.getenv("RERANKER_MODEL", cls.reranker_model),
-            ollama_host=os.getenv("OLLAMA_HOST", cls.ollama_host),
-            ollama_model=os.getenv("OLLAMA_MODEL", cls.ollama_model),
+            embedding_model=os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+            reranker_model=os.getenv("RERANKER_MODEL", DEFAULT_RERANKER_MODEL),
+            ollama_host=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
+            ollama_model=os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
             hosted_base_url=os.getenv("HOSTED_BASE_URL") or None,
             hosted_api_key=os.getenv("HOSTED_API_KEY") or None,
-            hosted_model=os.getenv("HOSTED_MODEL", cls.hosted_model),
+            hosted_model=os.getenv("HOSTED_MODEL", DEFAULT_HOSTED_MODEL),
             data_dir=Path(os.getenv("DATA_DIR", str(ROOT / "data"))),
+            allowed_origins=(
+                tuple(o.strip() for o in origins.split(",") if o.strip())
+                if (origins := os.getenv("ALLOWED_ORIGINS", ""))
+                else DEFAULT_ALLOWED_ORIGINS
+            ),
         )
