@@ -151,11 +151,16 @@ async def search(
 #: citation rendering, the evidence panel, the API — can then tell corpus
 #: evidence from live evidence without a parallel code path, and a reader is
 #: never shown an abstract as though it were a passage from a full paper.
-LIVE_PREFIX = "arxiv"
+#:
+#: Each source uses its own prefix. An earlier version hardcoded "arxiv", so a
+#: PubMed record was cited as "arxiv:PMID39541441" — a citation lying about
+#: where it came from, which is worse than an uncited claim because it looks
+#: checkable.
+LIVE_PREFIXES = ("arxiv", "pubmed")
 
 
 def is_live(chunk_id: str) -> bool:
-    return chunk_id.startswith(f"{LIVE_PREFIX}:")
+    return any(chunk_id.startswith(f"{p}:") for p in LIVE_PREFIXES)
 
 
 def to_chunks(papers: list[LivePaper]) -> list[Chunk]:
@@ -172,12 +177,15 @@ def to_chunks(papers: list[LivePaper]) -> list[Chunk]:
     for i, p in enumerate(papers):
         out.append(
             Chunk(
-                chunk_id=f"{LIVE_PREFIX}:{p.paper_id}",
-                doc_id=f"{LIVE_PREFIX}:{p.paper_id}",
+                chunk_id=f"{p.source}:{p.paper_id}",
+                doc_id=f"{p.source}:{p.paper_id}",
                 ordinal=i,
                 text=p.abstract,
                 section_kind="abstract",
-                section_heading=f"arXiv {p.paper_id} · abstract · {p.published}",
+                section_heading=(
+                    f"{'arXiv' if p.source == 'arxiv' else 'PubMed'} {p.paper_id}"
+                    f" · abstract · {p.published}"
+                ),
                 page_start=0,
                 page_end=0,
                 doc_title=p.title,
