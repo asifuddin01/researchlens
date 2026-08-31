@@ -14,9 +14,12 @@ say no.
 from __future__ import annotations
 
 import json
+import re
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -26,6 +29,14 @@ from researchlens.engine import Engine
 from researchlens.generate.citations import is_grounded, resolve
 from researchlens.generate.prompt import NO_EVIDENCE
 from researchlens.generate.provider import GenerationRequest
+from researchlens.uploads import MAX_BYTES, UploadError
+
+
+#: An upload session id. Opaque, client-held, and the only thing separating
+#: one reader's uploaded papers from another's — so it is checked for shape
+#: rather than trusted: a caller who sends a path or a wildcard here gets a
+#: 422, not a lookup.
+SESSION = Field(default=None, min_length=8, max_length=64, pattern="^[A-Za-z0-9_-]+$")
 
 
 class AskRequest(BaseModel):
@@ -34,12 +45,15 @@ class AskRequest(BaseModel):
     #: Restrict the answer to these papers. Empty or absent means the whole
     #: corpus, which is the common case and should need no argument.
     doc_ids: list[str] | None = Field(default=None, max_length=200)
+    #: Include this session's uploaded papers in the evidence.
+    session: str | None = SESSION
 
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=500)
     k: int = Field(default=8, ge=1, le=30)
     doc_ids: list[str] | None = Field(default=None, max_length=200)
+    session: str | None = SESSION
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -95,34 +109,55 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "mode": settings.mode,
             "papers": len(engine.documents),
             "passages": len(engine.chunks),
+            "uploads": settings.uploads_enabled,
             "providers": providers,
         }
 
     @app.get("/library")
-    async def library():
-        """The indexed papers, for the source browser."""
+    async def library(session: str | None = None):
+        """The indexed papers, for the source browser.
+
+        A session's uploaded papers are listed alongside the corpus and marked
+        `uploaded`, because the selector that confines an answer to chosen
+        papers has to be able to offer them — a paper you cannot pick is a
+        paper you cannot ask about on its own.
+        """
         counts: dict[str, int] = {}
         for c in engine.chunks:
             counts[c.doc_id] = counts.get(c.doc_id, 0) + 1
-        return {
-            "papers": [
+        papers = [
+            {
+                "doc_id": d.doc_id,
+                "title": d.title,
+                "authors": d.authors,
+                "pages": d.n_pages,
+                "passages": counts.get(d.doc_id, 0),
+                "uploaded": False,
+            }
+            for d in sorted(engine.documents, key=lambda d: d.title)
+        ]
+        mine = engine.uploaded_documents(session)
+        if mine:
+            up_counts = engine.uploaded_passage_counts(session)
+            papers = [
                 {
-                    "doc_id": d.doc_id,
-                    "title": d.title,
-                    "authors": d.authors,
-                    "pages": d.n_pages,
-                    "passages": counts.get(d.doc_id, 0),
+                    "doc_id": d.doc_id, "title": d.title, "authors": d.authors,
+                    "pages": d.n_pages, "passages": up_counts.get(d.doc_id, 0),
+                    "uploaded": True,
                 }
-                for d in sorted(engine.documents, key=lambda d: d.title)
-            ]
-        }
+                for d in mine
+            ] + papers
+        return {"papers": papers}
 
     @app.post("/search")
     async def search(req: SearchRequest):
         """Evidence without an answer. Useful on its own, and the fastest way
         to tell a retrieval problem from a generation one."""
         hits, ms = engine.retrieve(
-            req.query, top_k=req.k, doc_ids=set(req.doc_ids) if req.doc_ids else None
+            req.query,
+            top_k=req.k,
+            doc_ids=set(req.doc_ids) if req.doc_ids else None,
+            session=req.session,
         )
         return {
             "query": req.query,
@@ -148,6 +183,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 req.question,
                 req.provider,
                 doc_ids=set(req.doc_ids) if req.doc_ids else None,
+                session=req.session,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -188,7 +224,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         text streams; the evidence arrives at the end, in one event.
         """
         evidence, retrieval_ms = engine.retrieve(
-            req.question, doc_ids=set(req.doc_ids) if req.doc_ids else None
+            req.question,
+            doc_ids=set(req.doc_ids) if req.doc_ids else None,
+            session=req.session,
         )
         try:
             provider = engine.provider(req.provider)
@@ -251,15 +289,71 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     @app.post("/ingest")
-    async def ingest():
+    async def ingest(
+        file: UploadFile = File(...),
+        session: str | None = Form(default=None),
+    ):
+        """Add one PDF to the caller's session.
+
+        The paper is parsed, chunked and embedded into an index belonging to
+        that session alone. It is never written to disk and never joins the
+        corpus — see researchlens/uploads.py for why that is a correctness
+        requirement and not caution.
+
+        Returns the session id, generating one when the caller sent none, so a
+        first upload needs no setup and every later call can name the same
+        session.
+        """
         if not settings.uploads_enabled:
             raise HTTPException(
                 status_code=403,
                 detail="this instance serves a fixed corpus; run it locally to add papers",
             )
-        raise HTTPException(status_code=501, detail="upload is not implemented yet")
+        if session is not None and not _SESSION_OK.match(session):
+            raise HTTPException(status_code=422, detail="malformed session id")
+        session = session or secrets.token_urlsafe(16)
+
+        # Read with a ceiling rather than reading and then measuring: a client
+        # can claim any Content-Length it likes, and `await file.read()` on a
+        # 2 GB body spends the memory before the check runs.
+        raw = await file.read(MAX_BYTES + 1)
+        if len(raw) > MAX_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"file exceeds the {MAX_BYTES // 1024 // 1024} MB limit",
+            )
+
+        try:
+            doc = await run_in_threadpool(
+                engine.add_upload, session, raw, file.filename or "upload.pdf"
+            )
+        except UploadError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        return {
+            "session": session,
+            "doc_id": doc.doc_id,
+            "title": doc.title,
+            "authors": doc.authors,
+            "pages": doc.n_pages,
+            "sections": len(doc.sections),
+            "papers_open": len(engine.uploaded_documents(session)),
+        }
+
+    @app.delete("/ingest/{session}")
+    async def forget(session: str):
+        """Drop a session's uploaded papers. Idempotent."""
+        if not _SESSION_OK.match(session):
+            raise HTTPException(status_code=422, detail="malformed session id")
+        engine.drop_uploads(session)
+        return {"session": session, "papers_open": 0}
 
     return app
+
+
+#: Same shape the request models enforce, for the endpoints that take a
+#: session in the path or as form data, where pydantic is not doing it.
+_SESSION_OK = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 def _sse(event: str, data: dict) -> str:

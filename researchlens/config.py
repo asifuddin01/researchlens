@@ -70,9 +70,17 @@ class Settings:
     allowed_origins: tuple[str, ...] = DEFAULT_ALLOWED_ORIGINS
     providers: tuple[str, ...] = DEFAULT_PROVIDERS
 
+    #: Whether readers may add their own PDFs. On by default in both modes:
+    #: an upload lives in a per-session index that is never written to disk and
+    #: never merged into the corpus, so the demo can offer it without becoming
+    #: a document store or leaking one visitor's paper into another's answers.
+    #: The kill switch stays because bounded is not the same as free — parsing
+    #: and embedding cost CPU on shared hardware.
+    uploads: bool = True
+
     @property
     def uploads_enabled(self) -> bool:
-        return self.mode == "local"
+        return self.uploads
 
     @property
     def hosted_available(self) -> bool:
@@ -93,6 +101,8 @@ class Settings:
             hosted_api_key=os.getenv("HOSTED_API_KEY") or None,
             hosted_model=os.getenv("HOSTED_MODEL", DEFAULT_HOSTED_MODEL),
             data_dir=Path(os.getenv("DATA_DIR", str(ROOT / "data"))),
+            uploads=os.getenv("UPLOADS", "1").strip().lower()
+            not in ("0", "false", "no", "off"),
             allowed_origins=(
                 tuple(o.strip() for o in origins.split(",") if o.strip())
                 if (origins := os.getenv("ALLOWED_ORIGINS", ""))

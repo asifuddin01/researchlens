@@ -22,6 +22,9 @@ dependencies = [
   "rank-bm25>=0.2.2",
   "numpy>=1.26",
   "fastapi>=0.115",
+  # Required by FastAPI to accept an uploaded file. It arrives transitively
+  # today, which is not the same as being depended on.
+  "python-multipart>=0.0.9",
   "uvicorn[standard]>=0.32",
   "httpx>=0.27",
   "pyyaml>=6.0",

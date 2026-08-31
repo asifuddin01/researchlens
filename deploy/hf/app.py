@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import sys
 import time
 import warnings
@@ -49,6 +50,10 @@ from researchlens.generate.prompt import (  # noqa: E402
     build_prompt,
 )
 from researchlens.live.arxiv import is_live  # noqa: E402
+from researchlens.uploads import (  # noqa: E402
+    MAX_PAPERS_PER_SESSION,
+    UploadError,
+)
 
 # ZeroGPU: a GPU is attached only while a decorated function runs, and a Space
 # on that hardware must declare at least one or it refuses to start —
@@ -159,15 +164,23 @@ if ON_ZERO_GPU:
     _prefetch_model()
 
 
-def _evidence_markdown(citations) -> str:
+def _evidence_markdown(citations, mine: set[str] | None = None) -> str:
     if not citations:
         return ""
+    mine = mine or set()
     rows = ["### Evidence\n"]
     for c in citations:
         # A live result is an abstract fetched from arXiv or PubMed, not a
         # passage from an indexed paper, and is labelled so a reader is never
-        # shown one as though it were the other.
-        tag = " · **live**" if is_live(c.chunk_id) else ""
+        # shown one as though it were the other. A reader's own upload gets the
+        # same treatment for the same reason: the three kinds of evidence carry
+        # different weight and the answer should not blur them.
+        if is_live(c.chunk_id):
+            tag = " · **live**"
+        elif c.chunk_id.split(":", 1)[0] in mine:
+            tag = " · **your upload**"
+        else:
+            tag = ""
         rows.append(
             f"**[{c.marker}]** {c.doc_title}{tag}  \n"
             f"<sub>{c.section_heading} · p{c.pages}</sub>\n\n"
@@ -176,7 +189,9 @@ def _evidence_markdown(citations) -> str:
     return "\n".join(rows)
 
 
-def _ask_on_gpu(question: str, doc_ids: set[str] | None = None) -> tuple[str, str, str]:
+def _ask_on_gpu(
+    question: str, doc_ids: set[str] | None = None, session: str | None = None
+) -> tuple[str, str, str]:
     """Retrieve with the engine, generate on the attached GPU, then check.
 
     Retrieval and grounding are the engine's, unchanged — only the call that
@@ -187,11 +202,13 @@ def _ask_on_gpu(question: str, doc_ids: set[str] | None = None) -> tuple[str, st
     with nothing supported becomes a refusal.
     """
     started = time.perf_counter()
-    evidence, retrieval_ms = ENGINE.retrieve(question, doc_ids=doc_ids)
+    evidence, retrieval_ms = ENGINE.retrieve(question, doc_ids=doc_ids, session=session)
+    mine = {d.doc_id for d in ENGINE.uploaded_documents(session)}
 
     # Not when a subset is chosen: a reader who picked two papers has said the
-    # rest of the literature is not what they want.
-    if not doc_ids and question and _asks_for_survey(question):
+    # rest of the literature is not what they want. Not when they have uploaded
+    # a paper either — they came to ask about that.
+    if not doc_ids and not mine and question and _asks_for_survey(question):
         fetched = asyncio.run(ENGINE.live_evidence(question))
         if fetched:
             evidence = ENGINE._merge_live(question, fetched, evidence)
@@ -213,7 +230,7 @@ def _ask_on_gpu(question: str, doc_ids: set[str] | None = None) -> tuple[str, st
         f"· generation {generation_ms:.0f} ms"
     )
     _ = time.perf_counter() - started
-    return text, _evidence_markdown(citations), timing
+    return text, _evidence_markdown(citations, mine), timing
 
 
 #: Paper label -> doc_id, for the selector. Titles are truncated because a few
@@ -224,7 +241,83 @@ PAPER_CHOICES = sorted(
 )
 
 
-def ask(question: str, provider: str, papers: list[str] | None = None) -> tuple[str, str, str]:
+def _paper_choices(session: str | None) -> list[tuple[str, str]]:
+    """The selector's options: this reader's uploads first, then the corpus.
+
+    Theirs first because a reader who has just added a paper is about to look
+    for it, and a hundred and one alphabetised titles is not a place to search.
+    """
+    mine = [
+        (f"\u2b06 {d.title[:80]} (yours)", d.doc_id)
+        for d in ENGINE.uploaded_documents(session)
+    ]
+    return mine + PAPER_CHOICES
+
+
+def upload(
+    files, session: str | None, progress=gr.Progress()
+) -> tuple[str, str, dict]:
+    """Index the reader's PDFs into a session of their own.
+
+    Nothing is written to disk and nothing joins the corpus — the papers live
+    in this browser session and are dropped when it goes idle. That is stated
+    in the UI rather than buried here, because a reader handing over an
+    unpublished manuscript is owed the answer to "where does this go".
+    """
+    session = session or secrets.token_urlsafe(16)
+    if not files:
+        return session, "", gr.update()
+
+    added, failed = [], []
+    for i, f in enumerate(files):
+        path = Path(getattr(f, "name", f))
+        # Indexing a sixteen-page paper is about seven seconds on a laptop and
+        # longer on this Space's CPU: parse, chunk, then embed every passage.
+        # Without a progress line that reads as a page that has stopped
+        # working, and the reader uploads it again.
+        progress(i / max(len(files), 1), desc=f"Reading {path.name}…")
+        try:
+            doc = ENGINE.add_upload(session, path.read_bytes(), path.name)
+            added.append(f"**{doc.title or path.name}** — {doc.n_pages} pages")
+        except UploadError as e:
+            failed.append(f"{path.name}: {e}")
+        except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
+            failed.append(f"{path.name}: could not be read ({e})")
+
+    lines = []
+    if added:
+        lines.append("Indexed " + "; ".join(added) + ".")
+        lines.append(
+            "Ask anything — your papers get guaranteed room in the evidence, "
+            "or pick them in the selector to read them alone."
+        )
+    for msg in failed:
+        lines.append(f"\u26a0 {msg}")
+    open_now = len(ENGINE.uploaded_documents(session))
+    if open_now:
+        lines.append(
+            f"<sub>{open_now}/{MAX_PAPERS_PER_SESSION} open · held in memory for "
+            "this session only, never added to the public corpus, never written "
+            "to disk.</sub>"
+        )
+    return session, "\n\n".join(lines), gr.update(choices=_paper_choices(session))
+
+
+def forget(session: str | None) -> tuple[str, str, dict, None]:
+    """Drop this reader's papers now rather than at the timeout."""
+    if session:
+        ENGINE.drop_uploads(session)
+    return session, "Your papers have been dropped.", gr.update(
+        choices=_paper_choices(None), value=[]
+    ), None
+
+
+def ask(
+    question: str,
+    provider: str,
+    papers: list[str] | None = None,
+    session: str | None = None,
+) -> tuple[str, str, str]:
     question = (question or "").strip()
     if len(question) < 3:
         return "Ask a question about the indexed papers.", "", ""
@@ -235,8 +328,10 @@ def ask(question: str, provider: str, papers: list[str] | None = None) -> tuple[
 
     try:
         if provider == "gpu":
-            return _ask_on_gpu(question, doc_ids)
-        answer = asyncio.run(ENGINE.ask(question, provider, doc_ids=doc_ids))
+            return _ask_on_gpu(question, doc_ids, session)
+        answer = asyncio.run(
+            ENGINE.ask(question, provider, doc_ids=doc_ids, session=session)
+        )
     except ValueError as e:
         return f"**{e}**", "", ""
     except Exception as e:  # noqa: BLE001 — a demo should explain, not crash
@@ -246,7 +341,8 @@ def ask(question: str, provider: str, papers: list[str] | None = None) -> tuple[
         f"{answer.model} · retrieval {answer.retrieval_ms:.0f} ms "
         f"· generation {answer.generation_ms:.0f} ms"
     )
-    return answer.text, _evidence_markdown(answer.citations), timing
+    mine = {d.doc_id for d in ENGINE.uploaded_documents(session)}
+    return answer.text, _evidence_markdown(answer.citations, mine), timing
 
 
 # On ZeroGPU the attached GPU is the best option and needs no key, so it leads.
@@ -296,10 +392,38 @@ This is a read-only exhibit of a system that runs locally with no API key —
         choices=PAPER_CHOICES,
         value=[],
         multiselect=True,
-        label="Papers (leave empty to search all 101)",
+        label=f"Papers (leave empty to search all {len(ENGINE.documents)})",
         info="Pick one or more to confine the answer to them.",
     )
     submit = gr.Button("Ask", variant="primary")
+
+    # A session id, held per browser tab by Gradio. It is the only thing
+    # separating one reader's uploaded papers from another's, so it is
+    # generated here rather than accepted from anywhere.
+    session = gr.State(value=None)
+
+    with gr.Accordion("Add your own papers", open=False):
+        gr.Markdown(
+            f"""
+Drop in up to **{MAX_PAPERS_PER_SESSION} PDFs** and ask about them — on their
+own, or against the {len(ENGINE.documents)} indexed papers.
+
+They are parsed, chunked and embedded in memory for **your session only**.
+Nothing is written to disk, nothing is added to the public corpus, and nothing
+is visible to anyone else. An idle session is dropped after an hour.
+
+Text PDFs only: a scan has no text layer to retrieve, and the parser will say so
+rather than index a paper that can never be found.
+"""
+        )
+        uploader = gr.File(
+            label="PDFs",
+            file_count="multiple",
+            file_types=[".pdf"],
+            height=140,
+        )
+        upload_status = gr.Markdown()
+        clear_uploads = gr.Button("Forget my papers", size="sm")
 
     answer_box = gr.Markdown(label="Answer")
     timing_box = gr.Markdown()
@@ -311,10 +435,17 @@ This is a read-only exhibit of a system that runs locally with no API key —
 
     gr.Examples(examples=[[q] for q in EXAMPLES], inputs=[question])
 
-    inputs = [question, provider, papers]
+    inputs = [question, provider, papers, session]
     outputs = [answer_box, evidence_box, timing_box]
     submit.click(ask, inputs, outputs)
     question.submit(ask, inputs, outputs)
+
+    uploader.upload(
+        upload, [uploader, session], [session, upload_status, papers]
+    )
+    clear_uploads.click(
+        forget, [session], [session, upload_status, papers, uploader]
+    )
 
 
 # No custom /health here, deliberately. Gradio builds its FastAPI app inside

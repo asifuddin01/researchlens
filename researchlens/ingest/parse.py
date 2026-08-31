@@ -25,6 +25,7 @@ capping Recall@5.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import re
 import statistics
@@ -584,7 +585,20 @@ def _document_vocabulary(lines: list[_Line]) -> set[str]:
 
 
 def parse_pdf(path: str | Path) -> Document:
-    """Parse one PDF into a `Document` with real sections and page spans.
+    """Parse one PDF into a `Document` with real sections and page spans."""
+    path = Path(path)
+    return parse_bytes(path.read_bytes(), name=path.name, source=str(path))
+
+
+def parse_bytes(raw: bytes, name: str, source: str | None = None) -> Document:
+    """Parse PDF bytes into a `Document` with real sections and page spans.
+
+    Bytes rather than a path because an upload arrives as bytes, and writing it
+    to a temporary file first would give the parser two entry points that can
+    drift. The document id is the sha256 of those bytes either way, so a paper
+    uploaded and the same paper ingested from disk are the same document —
+    which is how an upload of something already in the corpus is recognised
+    rather than indexed twice.
 
     Raises `ValueError` when the file has no extractable text layer at all,
     which for this corpus means a scanned paper. Failing loudly is correct:
@@ -592,12 +606,10 @@ def parse_pdf(path: str | Path) -> Document:
     can never be retrieved, and the eval numbers would quietly worsen with no
     visible cause.
     """
-    path = Path(path)
-    raw = path.read_bytes()
     doc_id = hashlib.sha256(raw).hexdigest()[:16]
 
     lines: list[_Line] = []
-    with pdfplumber.open(path) as pdf:
+    with pdfplumber.open(io.BytesIO(raw)) as pdf:
         n_pages = len(pdf.pages)
         for i, page in enumerate(pdf.pages, start=1):
             lines.extend(_lines_from_page(page, i))
@@ -611,7 +623,7 @@ def parse_pdf(path: str | Path) -> Document:
     chars = sum(len(ln.text) for ln in lines)
     if chars < _MIN_CHARS_PER_PAGE * max(n_pages, 1):
         raise ValueError(
-            f"{path.name}: {chars} characters across {n_pages} pages "
+            f"{name}: {chars} characters across {n_pages} pages "
             f"({chars / max(n_pages, 1):.0f}/page) — no usable text layer. "
             "This is a scanned PDF; OCR it before ingesting, or drop it from "
             "the corpus. Indexing it would add a paper that can never be "
@@ -713,7 +725,7 @@ def parse_pdf(path: str | Path) -> Document:
 
     if not sections:
         raise ValueError(
-            f"{path.name}: text extracted but no sections survived. "
+            f"{name}: text extracted but no sections survived. "
             "Inspect with `python -m researchlens.ingest.parse <path> --debug`."
         )
 
@@ -723,7 +735,7 @@ def parse_pdf(path: str | Path) -> Document:
         authors=authors,
         sections=sections,
         n_pages=n_pages,
-        source_path=str(path),
+        source_path=source or name,
         arxiv_id=_sniff_arxiv_id(lines),
     )
 

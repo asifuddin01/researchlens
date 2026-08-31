@@ -93,14 +93,39 @@ same retrieved evidence.
 
 ## The public demo
 
-<https://asifuddin.com/researchlens> is the project's page. The hosted instance
-is **not deployed yet**, and the page says so rather than showing a question box
-that cannot answer — it gives the `docker compose up` instructions instead.
+<https://asifuddin.com/researchlens> is the project's page; the system itself
+runs at [asifuddin01/researchlens](https://huggingface.co/spaces/asifuddin01/researchlens)
+on a Hugging Face Space. Same engine, same grounding rules, same 101 papers —
+generation runs on the Space's attached GPU rather than a local model.
 
-When it is deployed it will run this same container in `demo` mode: fixed
-corpus, uploads off, rate-limited at the edge. It will be a read-only exhibit,
-not the system. A public deployment cannot honestly claim "your documents never
-leave your machine", so it will not.
+It cannot honestly claim "your documents never leave your machine", so it does
+not. What it does claim, and what the code enforces, is narrower and true: a
+paper you add there is parsed into an index belonging to **your browser session
+alone**, held in memory, never written to disk, never merged into the public
+corpus, and dropped when the session goes idle.
+
+That is not caution, it is correctness. A Space is *one process serving every
+visitor*, so appending an upload to the shared index would put a stranger's
+manuscript in someone else's answers, with a citation, indistinguishable from a
+paper that belongs there. `researchlens/uploads.py` exists to make that
+impossible rather than unlikely.
+
+### Adding papers
+
+```
+POST /ingest        multipart: file=@paper.pdf, session=<optional>
+                    → {"session": "...", "doc_id": "...", "title": "...", ...}
+POST /ask           {"question": "...", "session": "...", "doc_ids": [...]}
+DELETE /ingest/{session}
+```
+
+The session id is returned by the first upload and passed back on later calls.
+It is the only thing separating one reader's papers from another's, so it is
+generated server-side and checked for shape, never accepted as a free string.
+
+Limits, and why: 20 MB and 80 pages per paper, 5 papers per session, one hour
+idle. Parsing and embedding cost real CPU on shared hardware — a sixteen-page
+paper is about seven seconds on a laptop — and bounded is not the same as free.
 
 ## Layout
 
@@ -112,6 +137,7 @@ researchlens/
   ingest/chunk.py     sections → passages that can cite themselves
   retrieval/          bm25 · dense · fusion · rerank
   retrieval/pipeline.py   the ablation axis — one code path, four configurations
+  uploads.py          per-session papers, never merged into the corpus
   generate/           provider protocol + local and hosted implementations
   api/                FastAPI; the local UI and the demo share it
 eval/

@@ -40,11 +40,24 @@ def test_no_hosted_key_is_a_supported_state():
     assert s.uploads_enabled is True
 
 
-def test_demo_mode_disables_uploads():
+def test_demo_mode_still_allows_uploads():
+    """Demo mode used to disable uploads, and the reason was that an upload
+    would have been appended to the shared index — one visitor's paper in
+    everyone's answers. Uploads are per-session now, so the restriction went
+    with the reason. This test exists to say that out loud: if uploads ever
+    become global again, it must fail."""
     with mock.patch.dict(os.environ, {"RESEARCHLENS_MODE": "demo"}, clear=True):
         s = Settings.from_env()
     assert s.mode == "demo"
-    assert s.uploads_enabled is False
+    assert s.uploads_enabled is True
+
+
+def test_uploads_can_be_switched_off():
+    for value in ("0", "false", "off", "No"):
+        with mock.patch.dict(os.environ, {"UPLOADS": value}, clear=True):
+            assert Settings.from_env().uploads_enabled is False
+    with mock.patch.dict(os.environ, {"UPLOADS": "1"}, clear=True):
+        assert Settings.from_env().uploads_enabled is True
 
 
 def test_an_unknown_mode_is_rejected_at_startup():

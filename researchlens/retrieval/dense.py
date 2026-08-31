@@ -70,6 +70,18 @@ def _select_providers() -> list[str] | None:
     return None  # fastembed picks its own default
 
 
+#: One encoder per (model, threads), shared by every retriever that asks for
+#: it. Uploaded papers are indexed in their own small matrix, so a session with
+#: three papers open would otherwise construct three more `TextEmbedding`
+#: objects — each a separate 67 MB ONNX session and several seconds of load —
+#: to embed forty passages. The ablation builds four retrievers over one model
+#: for the same reason.
+#:
+#: Safe to share: an ONNX Runtime session is thread-safe for inference, and a
+#: single retriever already serves concurrent requests through one.
+_ENCODERS: dict[tuple[str, int], object] = {}
+
+
 class DenseRetriever:
     """Embeds chunks once, then answers queries by exhaustive cosine search."""
 
@@ -80,9 +92,32 @@ class DenseRetriever:
         model: str = DEFAULT_MODEL,
         query_instruction: str | None = None,
         cache_dir: Path | None = None,
-        batch_size: int = 64,
+        # Thirty-two, not sixty-four, and the difference is large. Measured on
+        # 43 real passages (mean 817 characters), twice, on both providers:
+        #
+        #     batch   4     6484 ms        batch  32     6736 ms
+        #     batch   8     6749 ms        batch  64    11182 ms
+        #     batch  16     6860 ms
+        #
+        # A batch is padded to its longest member, so every short passage in a
+        # wide batch is embedded at the length of the longest one it happens to
+        # be grouped with. Past ~32 the odds of catching a 512-token passage
+        # approach one and the whole batch pays for it. Below 32 there is
+        # nothing further to win.
+        #
+        # The vectors are not affected: 32 and 64 agree to 4.4e-4 absolute,
+        # cosine 0.99999976 — float reassociation under a different padding
+        # width, not a different encoding. The committed bundle was built at 64
+        # and stays valid.
+        batch_size: int = 32,
         threads: int | None = None,
+        cache: bool = True,
     ) -> None:
+        #: Whether `index` may read or write the on-disk vector cache. Off for
+        #: an uploaded paper: it belongs to one reader for one session, and
+        #: writing its vectors beside the corpus would leave a stranger's paper
+        #: on disk after they had gone.
+        self.cache = cache
         self.threads = threads if threads is not None else (os.cpu_count() or 4)
         self.model = model
         self.query_instruction = query_instruction
@@ -107,13 +142,16 @@ class DenseRetriever:
         a run that does not use them.
         """
         if self._encoder is None:
-            from fastembed import TextEmbedding
+            key = (self.model, self.threads)
+            if key not in _ENCODERS:
+                from fastembed import TextEmbedding
 
-            kwargs: dict = {"model_name": self.model, "threads": self.threads}
-            providers = _select_providers()
-            if providers:
-                kwargs["providers"] = providers
-            self._encoder = TextEmbedding(**kwargs)
+                kwargs: dict = {"model_name": self.model, "threads": self.threads}
+                providers = _select_providers()
+                if providers:
+                    kwargs["providers"] = providers
+                _ENCODERS[key] = TextEmbedding(**kwargs)
+            self._encoder = _ENCODERS[key]
         return self._encoder
 
     # ---- cache -----------------------------------------------------------
@@ -145,10 +183,9 @@ class DenseRetriever:
             raise ValueError("nothing to index — the corpus produced no chunks")
 
         self._ids = [c.chunk_id for c in chunks]
-        key = self._cache_key(chunks)
-        path = self._cache_path(key)
+        path = self._cache_path(self._cache_key(chunks)) if self.cache else None
 
-        if path.exists():
+        if path is not None and path.exists():
             with np.load(path) as z:
                 self._matrix = z["matrix"]
             print(f"  dense: {len(self._ids)} vectors from cache", file=sys.stderr)
@@ -175,8 +212,9 @@ class DenseRetriever:
         matrix = _l2_normalise(matrix)
         self._matrix = matrix
 
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, matrix=matrix)
+        if path is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(path, matrix=matrix)
 
     # ---- search ----------------------------------------------------------
 
