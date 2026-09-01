@@ -104,6 +104,14 @@ class Chunk:
     page_end: int
     #: Denormalised for display; a citation should not need a second lookup.
     doc_title: str
+    #: What to print where a page number would go, for sources that have no
+    #: pages. Live abstracts leave this unset and take the "abstract" default;
+    #: the author corpus sets "website", because calling a personal page an
+    #: abstract would dress a self-description as a scientific one.
+    page_label: str | None = None
+    #: Where a reader can go to check this passage themselves. Only sources
+    #: fetched from the web have one; a corpus PDF is cited by page instead.
+    url: str | None = None
 
     @property
     def pages(self) -> str:
@@ -111,10 +119,22 @@ class Chunk:
         # API, and printing "p0" would invite a reader to look for a page that
         # does not exist.
         if self.page_start == 0 and self.page_end == 0:
-            return "abstract"
+            return self.page_label or "abstract"
         if self.page_start == self.page_end:
             return str(self.page_start)
         return f"{self.page_start}-{self.page_end}"
+
+    @property
+    def page_ref(self) -> str:
+        """`pages` with the "p" only where a page number follows it.
+
+        The context block wrote `p{pages}` unconditionally, which for a live
+        abstract produced "pabstract" and for the author corpus "pwebsite".
+        Small, but it is text the model reads and the reader sees, and neither
+        should have to decode it.
+        """
+        pages = self.pages
+        return f"p{pages}" if pages[:1].isdigit() else pages
 
 
 @dataclass(frozen=True, slots=True)

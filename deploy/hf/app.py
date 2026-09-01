@@ -645,6 +645,11 @@ def ask_json(
         }
 
     mine = {d.doc_id for d in ENGINE.uploaded_documents(session or None)}
+    # Where a passage can be opened. Only web-fetched sources carry one; a
+    # corpus PDF is cited by page instead. Built from the evidence because
+    # `Citation` records the marker and the quote, not the origin URL.
+    links = {r.chunk.chunk_id: r.chunk.url for r in evidence if r.chunk.url}
+    from_site = [r for r in evidence if r.chunk.chunk_id.startswith("site:")]
 
     started = time.perf_counter()
     try:
@@ -673,6 +678,8 @@ def ask_json(
                     "quote": r.chunk.text[:400],
                     "live": is_live(r.chunk.chunk_id),
                     "yours": r.chunk.doc_id in mine,
+                    "site": r.chunk.chunk_id.startswith("site:"),
+                    "url": r.chunk.url or "",
                 }
                 for i, r in enumerate(evidence, start=1)
             ],
@@ -681,6 +688,7 @@ def ask_json(
             "generation_ms": 0.0,
             "passages": len(evidence),
             "papers": len({r.chunk.doc_id for r in evidence}),
+            "about_author": bool(from_site),
         }
     generation_ms = (time.perf_counter() - started) * 1000.0
 
@@ -700,6 +708,8 @@ def ask_json(
                 "quote": c.quote,
                 "live": is_live(c.chunk_id),
                 "yours": c.chunk_id.split(":", 1)[0] in mine,
+                "site": c.chunk_id.startswith("site:"),
+                "url": links.get(c.chunk_id, ""),
             }
             for c in citations
         ],
@@ -708,6 +718,10 @@ def ask_json(
         "generation_ms": round(generation_ms, 1),
         "passages": len(evidence),
         "papers": len({r.chunk.doc_id for r in evidence}),
+        # So the page can say the answer came from the site rather than the
+        # literature. A reader deserves to know a self-description is what
+        # they are reading before they decide how much to trust it.
+        "about_author": bool(from_site),
     }
 
 

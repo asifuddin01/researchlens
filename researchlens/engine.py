@@ -20,6 +20,7 @@ from pathlib import Path
 from researchlens.config import Settings
 from researchlens.generate.citations import is_grounded, resolve
 from researchlens.generate.prompt import NO_EVIDENCE, asks_for_a_survey
+from researchlens.live.author import asks_about_the_author
 from researchlens.generate.provider import GenerationRequest
 from researchlens.ingest.chunk import chunk_corpus
 from researchlens.ingest.library import load_library
@@ -87,6 +88,7 @@ class Engine:
         #: Why the last live search failed, if it did. Surfaced by /health so a
         #: broken live path is visible rather than merely quiet.
         self.last_live_error: str | None = None
+        self.last_author_error: str | None = None
         self._bundle_matrix = None
 
     # ---- startup ---------------------------------------------------------
@@ -338,6 +340,27 @@ class Engine:
         return [Retrieved(chunk=c, score=0.0, sources=frozenset({"live"}))
                 for c in arxiv.to_chunks(papers)]
 
+    async def author_evidence(self) -> list[Retrieved]:
+        """What the author's site says about the author.
+
+        Fetched rather than bundled, and cached by the module: the site is the
+        source of truth and rebuilds itself, so a copy kept here would drift
+        the first time a paper was added through the CMS and nobody thought to
+        re-ingest. See `researchlens.live.author`.
+
+        Unlike live search this is not scoped to Global. The site is not part
+        of the literature — it is the context of the page the reader is
+        standing on — and refusing to say who wrote the thing unless somebody
+        first ticked a box about arXiv would be a strange rule to explain.
+        """
+        from researchlens.live import author as author_source
+
+        chunks = await author_source.fetch()
+        # Same contract as live search: a failure is recorded, not swallowed.
+        self.last_author_error = author_source.last_error
+        return [Retrieved(chunk=c, score=0.0, sources=frozenset({"author"}))
+                for c in chunks]
+
     # ---- uploads ---------------------------------------------------------
 
     def add_upload(self, session: str, raw: bytes, filename: str) -> Document:
@@ -525,6 +548,38 @@ class Engine:
             question, fetched, corpus, slots, 1, 2, SERVING.top_k, floor_gap=1.5
         )
 
+    def _merge_author(
+        self, question: str, about: list[Retrieved], corpus: list[Retrieved]
+    ) -> list[Retrieved]:
+        """Give the site guaranteed room on a question about its author.
+
+        The same shape as `_merge_live` and for the same reason: a
+        cross-encoder ranks topical relevance, and on "what are the author's
+        strengths" a paper about lesion-aware retinopathy grading is genuinely
+        more *topical* than a paragraph of biography — it is dense with the
+        vocabulary of the work. It is also not an answer to the question.
+
+        The floor still applies. A site document that scores far below the best
+        evidence drops out, which is what keeps a review of somebody's reading
+        list from being cited in an answer about their supervisor.
+        """
+        from researchlens.live.author import resolve_anaphora
+
+        # Three quarters, where live search takes half. The remaining corpus
+        # passages are papers the author has *read*, and on "what does he work
+        # on" they are not merely unhelpful but actively misleading: observed
+        # directly, a 3B model handed four site passages and four corpus ones
+        # listed "Generative Agents: Interactive Simulacra of Human Behavior"
+        # among his projects. Fewer of them to misread, and a rule above
+        # saying not to.
+        slots = min(len(about), max(4, (SERVING.top_k * 3) // 4))
+        # One chunk per document already, so the per-doc cap is a formality —
+        # stated rather than left implicit so the call reads like its sibling.
+        return self._merge_reserved(
+            question, about, corpus, slots, 1, 2, SERVING.top_k, floor_gap=1.5,
+            reserved_question=resolve_anaphora(question),
+        )
+
     def _merge_reserved(
         self,
         question: str,
@@ -535,6 +590,7 @@ class Engine:
         rest_per_doc: int,
         limit: int,
         floor_gap: float | None = None,
+        reserved_question: str | None = None,
     ) -> list[Retrieved]:
         """Rank two pools separately, then give one of them guaranteed room.
 
@@ -551,7 +607,7 @@ class Engine:
         if self.pipeline is None or self.pipeline.reranker is None:
             return (reserved + rest)[:limit]
 
-        def rerank(pool: list[Retrieved], k: int) -> list[Retrieved]:
+        def rerank(pool: list[Retrieved], k: int, q: str | None = None) -> list[Retrieved]:
             if not pool or k <= 0:
                 return []
             by_id = {r.chunk.chunk_id: r for r in pool}
@@ -563,12 +619,18 @@ class Engine:
                     rerank_score=score, sources=by_id[cid].sources,
                 )
                 for cid, score in self.pipeline.reranker.rerank(
-                    question, [r.chunk for r in pool], k
+                    q or question, [r.chunk for r in pool], k
                 )
             ]
 
         ranked_rest = rerank(rest, limit)
-        head = self._diversify(rerank(reserved, slots * 2), reserved_per_doc, slots)
+        # The two pools may be ranked against different phrasings of the same
+        # question. Only the author corpus uses this, and only to put a name
+        # where the reader wrote a pronoun — see `author.resolve_anaphora`.
+        head = self._diversify(
+            rerank(reserved, slots * 2, reserved_question or question),
+            reserved_per_doc, slots,
+        )
 
         if floor_gap is not None and ranked_rest:
             # A reserved slot is for recency, not for charity. Asked what is
@@ -629,6 +691,11 @@ class Engine:
             # the rest of the literature is not what they want.
             live = (
                 asks_for_a_survey(question)
+                # "Recently what is Asif doing?" trips the survey words, but
+                # the author is not a field and arXiv has no opinion on him.
+                # Without this the question paid for three literature searches
+                # to fetch abstracts that the floor then dropped.
+                and not asks_about_the_author(question)
                 and not doc_ids
                 and not self.uploaded_documents(session)
             )
@@ -637,6 +704,22 @@ class Engine:
             fetched = await self.live_evidence(question)
             if fetched:
                 evidence = self._merge_live(question, fetched, evidence)
+
+        # The site is consulted when the question is about the person rather
+        # than about a literature, and — unlike live search — regardless of
+        # scope, because "who wrote this" is not a question about arXiv.
+        #
+        # Excluded in exactly the two cases live search is: a reader who chose
+        # papers, or uploaded their own, has said what they want evidence from,
+        # and a biography is not it.
+        if (
+            asks_about_the_author(question)
+            and not doc_ids
+            and not self.uploaded_documents(session)
+        ):
+            about = await self.author_evidence()
+            if about:
+                evidence = self._merge_author(question, about, evidence)
 
         # One paper should not fill the context on an ordinary question. When a
         # reader has *chosen* the papers, the cap is the opposite of what they

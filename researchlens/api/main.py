@@ -362,9 +362,13 @@ def _answer_json(answer) -> dict:
                 "section_heading": c.section_heading,
                 "pages": c.pages,
                 "quote": c.quote,
+                # The site is not the literature, and a reader should be able
+                # to see which one a claim rests on without opening it.
+                "site": c.chunk_id.startswith("site:"),
             }
             for c in answer.citations
         ],
+        "about_author": any(c.chunk_id.startswith("site:") for c in answer.citations),
     }
 
 

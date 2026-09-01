@@ -153,6 +153,48 @@ async def main_async(args) -> int:
             fatal=False,
         )
 
+        # --- the author corpus ------------------------------------------
+        #
+        # Fetched from the live site, so this belongs with the other network
+        # checks. Split the same way live search is: whether the site reaches
+        # the prompt is this system's to guarantee, whether the model then
+        # writes from it is the model's business.
+        from researchlens.live import author as author_source
+
+        about_q = "What research does the author do, and what is he working on?"
+        site_chunks = await author_source.fetch()
+        check(
+            "the author corpus is reachable",
+            bool(site_chunks),
+            f"{len(site_chunks)} documents from {author_source.CORPUS_URL}"
+            + (f" — {author_source.last_error}" if author_source.last_error else ""),
+            fatal=False,
+        )
+        if site_chunks:
+            check(
+                "the site is not labelled as a paper",
+                all(c.pages == "website" for c in site_chunks),
+                fatal=False,
+            )
+            about, _ms = await engine.evidence_for(about_q)
+            reached_site = [r for r in about if r.chunk.chunk_id.startswith("site:")]
+            check(
+                "the site reaches the prompt on a question about the author",
+                bool(reached_site),
+                f"{len(reached_site)} site passages, top: "
+                + (reached_site[0].chunk.doc_title[:40] if reached_site else "none"),
+                fatal=False,
+            )
+            # The failure this guards against is the one that would make every
+            # other answer worse: biography leaking into a scientific question.
+            technical, _ms = await engine.evidence_for(
+                "how does retrieval-augmented generation reduce hallucination?"
+            )
+            check(
+                "the site stays out of a technical question",
+                not any(r.chunk.chunk_id.startswith("site:") for r in technical),
+            )
+
     return _summary()
 
 

@@ -19,9 +19,10 @@ because the two are indistinguishable to a reader.
 from __future__ import annotations
 
 from researchlens.live.arxiv import is_live
+from researchlens.live.author import asks_about_the_author
 from researchlens.types import Retrieved
 
-SYSTEM = """You answer questions about scientific papers using only the numbered passages provided.
+SYSTEM = """You answer questions using only the numbered passages provided.
 
 Rules:
 - Use only the passages. If they do not answer the question, say so plainly.
@@ -34,6 +35,10 @@ Rules:
   not its full text. It supports what that paper claims or sets out to do. It
   does not support a statement about what was measured, on which dataset, or
   with what result, because the abstract may not say and a reader cannot check.
+- A passage marked (AUTHOR'S OWN WEBSITE) is the author describing their own
+  work. Answer questions about the author from these, cited like any other.
+  It is a self-description, not a reviewed finding. The papers in the other
+  passages are ones the author has read, not ones they wrote.
 
 If the question asks what is *current*, *recent*, *trending*, or what a field
 is doing now, you are being asked something a fixed set of papers cannot fully
@@ -43,6 +48,26 @@ and do not present the passages as a survey of the field."""
 NO_EVIDENCE = (
     "I could not find sufficient evidence in the indexed papers to answer that."
 )
+
+
+def _passage_kind(chunk_id: str) -> str:
+    """What to call this block so the model does not overstate it.
+
+    A bug worth recording: this test used to be `startswith("arxiv:")`, inline
+    and written when arXiv was the only live source. PubMed and OpenAlex were
+    added later, and their abstracts have been reaching the model labelled
+    "passage" ever since — the precise confusion the label exists to prevent,
+    in two of the three live sources, while `is_live` twenty lines below had
+    the correct list all along. Asking the source of truth rather than keeping
+    a second copy of it is what fixes it and what stops it recurring.
+    """
+    if is_live(chunk_id):
+        return "ABSTRACT ONLY"
+    # Not a paper at all. The model must not write about a personal website as
+    # though it reported, measured or found anything.
+    if chunk_id.startswith("site:"):
+        return "AUTHOR'S OWN WEBSITE"
+    return "passage"
 
 
 def build_context(evidence: list[Retrieved], max_chars: int = 9000) -> str:
@@ -65,9 +90,9 @@ def build_context(evidence: list[Retrieved], max_chars: int = 9000) -> str:
         # from an indexed paper. Marking them keeps the model from writing
         # "the paper reports X on dataset Y" when the abstract never said so —
         # an abstract supports what a paper *claims*, not what it measured.
-        kind = "ABSTRACT ONLY" if c.chunk_id.startswith("arxiv:") else "passage"
+        kind = _passage_kind(c.chunk_id)
         block = (
-            f"[{i}] ({kind}) {c.doc_title} — {c.section_heading}, p{c.pages}\n{c.text}\n"
+            f"[{i}] ({kind}) {c.doc_title} — {c.section_heading}, {c.page_ref}\n{c.text}\n"
         )
         if used + len(block) > max_chars and parts:
             break
@@ -115,7 +140,11 @@ def build_prompt(question: str, evidence: list[Retrieved], history=None) -> tupl
         turns = f"\nEarlier in this conversation:\nQ: {q}\nA: {a[:400]}\n"
 
     scope = ""
-    if asks_for_a_survey(question):
+    # A question about the author can trip the survey words — "what is he
+    # working on recently" — and the clause below would then tell the model to
+    # caveat a biography as an incomplete survey of a field. The site is not a
+    # field, so the clause simply does not apply.
+    if asks_for_a_survey(question) and not asks_about_the_author(question):
         # Two versions, because the single one went stale the day live search
         # landed. It told the model its evidence was "a fixed set of indexed
         # papers" even when half of it was abstracts fetched from arXiv,
