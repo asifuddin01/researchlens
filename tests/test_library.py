@@ -8,6 +8,7 @@ the live endpoint is checked by scripts/verify.py.
 """
 
 import asyncio
+import threading
 
 import httpx
 import pytest
@@ -361,6 +362,81 @@ def test_an_empty_library_costs_nothing_to_search(monkeypatch):
     idx = LibraryIndex(embedding_model="x", reranker=_Reranker())
     from researchlens.engine import SERVING
     assert idx.search("anything", SERVING) == []
+
+
+# --- refreshing -------------------------------------------------------------
+
+def _engine_with(library):
+    e = Engine.__new__(Engine)
+    e.library = library
+    e._library_thread = None
+    e._library_lock = threading.Lock()
+    e.last_library_error = None
+    return e
+
+
+def test_the_refresh_survives_a_per_request_event_loop():
+    """The deployment that matters drives retrieval with `asyncio.run` per
+    request. A task started on that loop is cancelled when the answer is done,
+    so the refresh would have been abandoned mid-download on every question and
+    the library would have indexed nothing — while working perfectly under the
+    API, which keeps one loop for the process."""
+    done = threading.Event()
+
+    class _Slow:
+        last_error = None
+
+        async def refresh(self, force=False):
+            # Long enough to outlive the caller's loop several times over.
+            await asyncio.sleep(0.05)
+            done.set()
+
+    e = _engine_with(_Slow())
+
+    async def one_request():
+        e.ensure_library_fresh()
+
+    asyncio.run(one_request())  # the loop closes here
+    assert done.wait(3.0), "the refresh did not survive the request that started it"
+
+
+def test_two_questions_do_not_start_two_refreshes():
+    """Downloading and parsing every listed paper twice at once would double
+    the cost of the thing the background thread exists to keep cheap."""
+    started = threading.Semaphore(0)
+    release = threading.Event()
+    runs = []
+
+    class _Blocking:
+        last_error = None
+
+        async def refresh(self, force=False):
+            runs.append(1)
+            started.release()
+            release.wait(3.0)
+
+    e = _engine_with(_Blocking())
+    e.ensure_library_fresh()
+    assert started.acquire(timeout=3.0)
+    e.ensure_library_fresh()
+    e.ensure_library_fresh()
+    release.set()
+    e._library_thread.join(timeout=3.0)
+    assert len(runs) == 1
+
+
+def test_a_thrown_refresh_is_recorded_rather_than_lost():
+    """An exception escaping a daemon thread is printed to stderr and gone."""
+    class _Broken:
+        last_error = None
+
+        async def refresh(self, force=False):
+            raise RuntimeError("manifest is not JSON")
+
+    e = _engine_with(_Broken())
+    e.ensure_library_fresh()
+    e._library_thread.join(timeout=3.0)
+    assert e.last_library_error and "manifest is not JSON" in e.last_library_error
 
 
 # --- merging ----------------------------------------------------------------

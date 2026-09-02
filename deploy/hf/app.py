@@ -80,6 +80,11 @@ os.environ.setdefault("RERANK_CANDIDATES", "12")
 
 ENGINE = Engine(Settings.from_env())
 ENGINE.load()
+# And start fetching whatever the author has added since the bundle was built.
+# In a thread, so the Space finishes starting while it downloads: a container
+# that waited for this would be slower to wake for a paper nobody has asked
+# about yet.
+ENGINE.ensure_library_fresh()
 
 EXAMPLES = [
     "Do deep-learning models outperform linear baselines at predicting perturbation effects?",
@@ -530,12 +535,26 @@ def respond(message, history, provider, papers, live_mode, session):
 
 def corpus_stats() -> dict:
     """What the running system actually holds, so a page never states a figure
-    the system disagrees with."""
+    the system disagrees with.
+
+    Which now includes the papers the author has added through his CMS since
+    the bundle was built. They are indexed exactly as the bundled ones are, so
+    counting them separately would make this disagree with the site — the one
+    thing this function exists to prevent.
+
+    Asking also starts a refresh, so the figure a reader is shown is derived
+    from the manifest as it stands rather than as it stood when the container
+    woke up. It does not wait for one: the count moves on the next load, which
+    is the right trade for a number in a header.
+    """
+    ENGINE.ensure_library_fresh()
+    lib = ENGINE.library.stats() if ENGINE.library else {"documents": 0, "passages": 0}
     return {
-        "papers": len(ENGINE.documents),
-        "passages": len(ENGINE.chunks),
+        "papers": len(ENGINE.documents) + lib["documents"],
+        "passages": len(ENGINE.chunks) + lib["passages"],
         "model": GPU_MODEL if ON_ZERO_GPU else ENGINE.settings.ollama_model,
         "sources": ["arxiv", "pubmed", "openalex"],
+        "added": lib["documents"],
     }
 
 

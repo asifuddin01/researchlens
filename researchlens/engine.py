@@ -15,6 +15,7 @@ import asyncio
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -108,7 +109,8 @@ class Engine:
         #: Papers the author adds through his CMS, fetched and indexed at run
         #: time. See researchlens/library.py for why they are not in the bundle.
         self.library: LibraryIndex | None = None
-        self._library_task: asyncio.Task | None = None
+        self._library_thread: threading.Thread | None = None
+        self._library_lock = threading.Lock()
         self._bundle_matrix = None
 
     # ---- startup ---------------------------------------------------------
@@ -913,17 +915,49 @@ class Engine:
         earlier. The question in flight is answered from whatever is indexed
         now; the one after it gets the new paper.
 
-        This is what makes the hourly-cache-versus-fresh-index tension go away.
+        This is what makes the cache-window-versus-fresh-index tension go away.
         The check is cheap enough to run on every question — an unchanged
         manifest is one conditional request, and an unchanged set of passages
         does not rebuild anything — so the index converges on the site within a
         cache window without ever standing between a question and its answer.
+
+        A thread rather than `asyncio.create_task`, and the difference is the
+        whole feature. The Space drives retrieval with `asyncio.run` per
+        request, which closes its loop when the answer is done — a task started
+        on that loop is cancelled the moment it stops being needed, so the
+        refresh would have been abandoned mid-download on every question and
+        the library would have indexed precisely nothing there. It would have
+        worked under the API, which keeps one loop for the process, and failed
+        silently on the deployment that matters. A thread owns its own loop and
+        does not care how the caller drives theirs.
+
+        Embedding runs on ONNX at batch 32 here, well under the sizes that make
+        it unsafe to call off the main thread.
         """
         if self.library is None:
             return
-        if self._library_task is not None and not self._library_task.done():
-            return
-        self._library_task = asyncio.create_task(self.refresh_library())
+        with self._library_lock:
+            if self._library_thread is not None and self._library_thread.is_alive():
+                return
+            self._library_thread = threading.Thread(
+                target=self._refresh_library_blocking,
+                name="library-refresh",
+                daemon=True,
+            )
+            self._library_thread.start()
+
+    def _refresh_library_blocking(self) -> None:
+        """The thread body: one loop of its own, and nothing raised out of it.
+
+        Whatever fails here — a manifest that will not parse, a PDF that hangs
+        up — costs the papers it would have added and nothing else. An
+        exception escaping a daemon thread would be printed to stderr and lost;
+        recorded here, it reaches /health.
+        """
+        try:
+            asyncio.run(self.refresh_library())
+        except Exception as e:                               # noqa: BLE001
+            self.last_library_error = f"{type(e).__name__}: {e}"
 
     async def refresh_library(self, force: bool = False) -> None:
         """Bring the library index up to date, and wait for it.
