@@ -74,6 +74,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Index at startup, not per request: the ONNX weights and the chunk
         # index are tens of seconds and hundreds of megabytes.
         engine.load()
+        # And start fetching whatever the author has added since the bundle was
+        # built. Not awaited: downloading and parsing his papers should not
+        # stand between the container starting and its first answer, and the
+        # only thing lost by an early question is the papers it would have
+        # searched — which it would have lost anyway had it arrived first.
+        engine.ensure_library_fresh()
         yield
 
     app = FastAPI(
@@ -113,11 +119,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             providers.append(
                 {"name": name, "model": p.model, "ready": await p.healthy()}
             )
+        # The author's added papers count as papers, because they are indexed
+        # exactly as the bundled ones are — a reader comparing this number with
+        # the one on the site should find them equal. Their own figures are
+        # reported alongside so an empty library can be told from a broken one:
+        # zero papers and no error is an author who has added none, zero papers
+        # with an error is a fetch that failed.
+        lib = engine.library.stats() if engine.library else {"documents": 0, "passages": 0}
         return {
             "status": "ok" if engine.ready else "loading",
             "mode": settings.mode,
-            "papers": len(engine.documents),
-            "passages": len(engine.chunks),
+            "papers": len(engine.documents) + lib["documents"],
+            "passages": len(engine.chunks) + lib["passages"],
+            "bundled": {"papers": len(engine.documents), "passages": len(engine.chunks)},
+            "library": lib,
             "uploads": settings.uploads_enabled,
             "providers": providers,
         }
@@ -131,9 +146,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         papers has to be able to offer them — a paper you cannot pick is a
         paper you cannot ask about on its own.
         """
+        # Ask whether the author has added anything since the last question.
+        # Not awaited: the listing should render now, from what is indexed now,
+        # and a paper uploaded thirty seconds ago appears on the next load
+        # rather than holding this one open while it downloads.
+        engine.ensure_library_fresh()
+
+        indexed = list(engine.documents)
+        if engine.library is not None:
+            # Listed as ordinary papers, not marked out, because that is what
+            # they are: the selector's job is to say what can be asked about,
+            # and how a paper reached the index is not the reader's business.
+            indexed += engine.library.documents
+
         counts: dict[str, int] = {}
         for c in engine.chunks:
             counts[c.doc_id] = counts.get(c.doc_id, 0) + 1
+        if engine.library is not None:
+            for c in engine.library.chunks:
+                counts[c.doc_id] = counts.get(c.doc_id, 0) + 1
+
         papers = [
             {
                 "doc_id": d.doc_id,
@@ -143,7 +175,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "passages": counts.get(d.doc_id, 0),
                 "uploaded": False,
             }
-            for d in sorted(engine.documents, key=lambda d: d.title)
+            for d in sorted(indexed, key=lambda d: d.title)
         ]
         mine = engine.uploaded_documents(session)
         if mine:

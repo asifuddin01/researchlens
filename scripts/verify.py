@@ -238,6 +238,53 @@ async def main_async(args) -> int:
                 not any(r.chunk.chunk_id.startswith("elementa:") for r in about_author),
             )
 
+        # --- the added library --------------------------------------------
+        #
+        # Papers the author adds through his CMS. An empty library is the
+        # ordinary state and not a failure — he may have added none — so what
+        # is checked is that the manifest is reachable and that whatever it
+        # lists actually became passages. A listed paper that indexed as
+        # nothing is the failure worth catching: it looks identical, from the
+        # outside, to a paper the corpus has nothing to say about.
+        from researchlens.live import library as library_source
+
+        await engine.refresh_library(force=True)
+        lib = engine.library
+        check(
+            "the library manifest is reachable",
+            library_source.last_error is None,
+            f"{len(lib.documents)} papers, {len(lib.chunks)} passages from "
+            f"{library_source.MANIFEST_URL}"
+            + (f" — {library_source.last_error}" if library_source.last_error else ""),
+            fatal=False,
+        )
+        for reason in lib.skipped:
+            check(f"library: {reason}", False, fatal=False)
+        if lib.documents:
+            check(
+                "an added paper is not a duplicate of a bundled one",
+                not (lib.doc_ids & {d.doc_id for d in engine.documents}),
+            )
+            check(
+                "every added passage is separately citable",
+                len({c.chunk_id for c in lib.chunks}) == len(lib.chunks),
+            )
+            check(
+                "an added paper can be opened from its citation",
+                all(c.url for c in lib.chunks),
+                fatal=False,
+            )
+            # It has to be able to win, or indexing it changed nothing. Asked
+            # about its own subject, the paper should reach the prompt.
+            title = sorted(lib.documents, key=lambda d: d.doc_id)[0].title
+            found, _ms = await engine.evidence_for(title)
+            check(
+                "an added paper reaches the prompt when asked about",
+                any(r.chunk.doc_id in lib.doc_ids for r in found),
+                f"asked: {title[:48]}",
+                fatal=False,
+            )
+
     # --- limitations ----------------------------------------------------
     #
     # Corpus-only, so it runs whether or not live search was asked for. The

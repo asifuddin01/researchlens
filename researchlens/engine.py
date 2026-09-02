@@ -11,6 +11,7 @@ make the demo unusable and the memory ceiling unreachable.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -30,6 +31,7 @@ from researchlens.retrieval.dense import DenseRetriever
 from researchlens.retrieval.pipeline import RetrievalConfig, RetrievalPipeline
 from researchlens.retrieval.rerank import CrossEncoderReranker
 from researchlens.types import Answer, Chunk, Document, Retrieved
+from researchlens.library import LibraryIndex
 from researchlens.uploads import UploadStore
 
 #: What the API serves. The ablation may yet show the reranker earns nothing on
@@ -72,6 +74,17 @@ SERVING = RetrievalConfig(
     candidates=RERANK_CANDIDATES, top_k=8,
 )
 
+#: Candidates reranked from the author's added library, which is searched in a
+#: pipeline of its own and therefore costs a second rerank pass on top of the
+#: corpus's. On the free Space thirty passes take 13.6 s, so charging every
+#: question a second thirty to consult a handful of papers would trade the
+#: demo's responsiveness for a pool that does not need the depth: the corpus
+#: draws 30 from 9,593 passages, the library from a few thousand at most.
+#:
+#: Nothing is charged at all while the library is empty — no papers, no
+#: pipeline, and the search returns before it reaches the reranker.
+LIBRARY_CANDIDATES = int(os.getenv("LIBRARY_RERANK_CANDIDATES", "10"))
+
 
 class Engine:
     """Library, index and providers, ready to answer."""
@@ -91,6 +104,11 @@ class Engine:
         self.last_live_error: str | None = None
         self.last_author_error: str | None = None
         self.last_elementa_error: str | None = None
+        self.last_library_error: str | None = None
+        #: Papers the author adds through his CMS, fetched and indexed at run
+        #: time. See researchlens/library.py for why they are not in the bundle.
+        self.library: LibraryIndex | None = None
+        self._library_task: asyncio.Task | None = None
         self._bundle_matrix = None
 
     # ---- startup ---------------------------------------------------------
@@ -134,6 +152,13 @@ class Engine:
             embedding_model=self.settings.embedding_model,
             # The corpus reranker, borrowed. Sharing it is what keeps an
             # uploaded passage's score comparable with a corpus passage's.
+            reranker=self.pipeline.reranker,
+            corpus_doc_ids={d.doc_id for d in self.documents},
+        )
+        self.library = LibraryIndex(
+            embedding_model=self.settings.embedding_model,
+            # Borrowed for the same reason uploads borrow it: one cross-encoder
+            # keeps a library passage's score comparable with a corpus one's.
             reranker=self.pipeline.reranker,
             corpus_doc_ids={d.doc_id for d in self.documents},
         )
@@ -265,6 +290,13 @@ class Engine:
         )
         results, ms = self.pipeline.timed_search(question, config, doc_ids)
 
+        if self.library is not None:
+            started = time.perf_counter()
+            added = self.library.search(question, self._library_config(k), doc_ids)
+            if added:
+                results = self._merge_library(added, results, k)
+            ms += (time.perf_counter() - started) * 1000.0
+
         if self.uploads is not None and session:
             started = time.perf_counter()
             mine = self.uploads.search(session, question, config, doc_ids)
@@ -272,6 +304,62 @@ class Engine:
                 results = self._merge_uploaded(question, mine, results, k)
             ms += (time.perf_counter() - started) * 1000.0
         return results, ms
+
+    @staticmethod
+    def _library_config(k: int) -> RetrievalConfig:
+        """The serving configuration, on a shallower candidate pool."""
+        return RetrievalConfig(
+            label="library", use_dense=True, use_bm25=True, use_rerank=True,
+            candidates=LIBRARY_CANDIDATES, top_k=k,
+        )
+
+    def _merge_library(
+        self, added: list[Retrieved], corpus: list[Retrieved], k: int
+    ) -> list[Retrieved]:
+        """Let an added paper compete as the corpus paper it is.
+
+        No reserved slots, unlike every other merge here — and the difference
+        is the point. Live search, the author corpus and the Elementa are all
+        reserved because they are *other kinds of thing* that the cross-encoder
+        would rank below an on-topic corpus passage: a recent abstract, a
+        biography, a page of teaching. A paper the author adds to his library
+        is not another kind of thing. It is a paper, and it is in the index for
+        the same reason the other hundred and one are; it simply arrived after
+        the bundle was built. Reserving room for it would put a thumb on the
+        scale for the accident of when it was uploaded.
+
+        The two pools can be merged by score without reranking again because
+        both were scored by the same cross-encoder, and its scores are absolute
+        rather than pool-relative — the property `_merge_reserved` notes it is
+        deliberately *not* relying on. Here there is no editorial reason to
+        override it, so the merge is the ordering.
+
+        The per-paper cap applies to the added side only, and that asymmetry
+        was a bug before it was a decision. Capping the union re-ran a
+        diversity rule the corpus pipeline had already applied under its own
+        settings, which *discarded* corpus passages — and then backfilled the
+        slots it had just freed with whatever the library had, because sorting
+        cannot leave a slot empty. Asked how retrieval-augmented generation
+        reduces hallucination, with a paper on renal radii in the library, the
+        merge dropped two corpus passages scoring +0.91 and +0.22 and seated
+        the radii paper at -11.25 and -11.38 in their place.
+
+        Leaving the corpus pool alone makes the merge a fair fight instead. The
+        two pools are scored by the same cross-encoder on the same absolute
+        scale, and the corpus supplies a full k, so an added passage takes a
+        slot only by outscoring a corpus passage for it — which is exactly the
+        competition an added paper should have to win, and it is why no
+        relevance floor is needed here as it is for live search. On that same
+        question the added paper now places last twice and reaches nothing.
+
+        The cap that remains stops one added paper from taking the whole
+        answer: six of eight passages from a single source is a paraphrase of
+        it wearing the question's clothes, which is what `_diversify` exists to
+        prevent, and two per paper is the limit every other merge here uses.
+        """
+        merged = self._diversify(added, 2, k) + corpus
+        merged.sort(key=lambda r: r.score, reverse=True)
+        return merged[:k]
 
     def _merge_uploaded(
         self, question: str, uploaded: list[Retrieved], corpus: list[Retrieved], k: int
@@ -813,6 +901,40 @@ class Engine:
         tail = self._diversify(ranked_rest, rest_per_doc, limit - len(head))
         return head + tail
 
+    # ---- the author's library --------------------------------------------
+
+    def ensure_library_fresh(self) -> None:
+        """Start a refresh if one is due, and do not wait for it.
+
+        Deliberately not awaited. Re-indexing means downloading and parsing
+        every listed paper and embedding the result — seconds on this machine,
+        considerably more on a sleeping Space — and a reader who asked a
+        question should not pay for the author having uploaded a paper a moment
+        earlier. The question in flight is answered from whatever is indexed
+        now; the one after it gets the new paper.
+
+        This is what makes the hourly-cache-versus-fresh-index tension go away.
+        The check is cheap enough to run on every question — an unchanged
+        manifest is one conditional request, and an unchanged set of passages
+        does not rebuild anything — so the index converges on the site within a
+        cache window without ever standing between a question and its answer.
+        """
+        if self.library is None:
+            return
+        if self._library_task is not None and not self._library_task.done():
+            return
+        self._library_task = asyncio.create_task(self.refresh_library())
+
+    async def refresh_library(self, force: bool = False) -> None:
+        """Bring the library index up to date, and wait for it.
+
+        For startup and for tests. Serving uses `ensure_library_fresh`.
+        """
+        if self.library is None:
+            return
+        await self.library.refresh(force=force)
+        self.last_library_error = self.library.last_error
+
     async def evidence_for(
         self,
         question: str,
@@ -834,6 +956,7 @@ class Engine:
         # for — the split has to happen over a pool deep enough to contain
         # them. 24 rather than 8; the extra cost is one rerank pass.
         wants_limits = asks_for_limitations(question)
+        self.ensure_library_fresh()
         evidence, retrieval_ms = self.retrieve(
             question,
             top_k=SERVING.top_k * 3 if wants_limits else None,

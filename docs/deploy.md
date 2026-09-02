@@ -112,7 +112,7 @@ touches is instant, and only the part they explicitly choose is slow.
 
 - **The image needs no PDFs.** `scripts/export_bundle.py` writes passages and
   vectors — 24 MB against ~600 MB of corpus — and the engine loads them
-  directly. Verified with the PDFs absent: 101 papers, 9,540 passages, 0.5 s.
+  directly. Verified with the PDFs absent: 101 papers, 9,593 passages, 0.5 s.
 - **`deploy/fly.retrieval.toml`** and **`deploy/fly.ollama.toml`**, sized and
   annotated.
 - **`deploy/worker/`** — per-IP hourly limit, whole-instance daily ceiling,
