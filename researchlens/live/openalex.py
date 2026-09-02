@@ -33,6 +33,7 @@ import re
 
 import httpx
 
+from researchlens.live import query
 from researchlens.live.arxiv import LivePaper
 
 API = "https://api.openalex.org/works"
@@ -42,16 +43,6 @@ API = "https://api.openalex.org/works"
 #: yourself is both ruder and slower.
 _MAILTO = "researchlens@users.noreply.github.com"
 
-_STOP = {
-    "what", "are", "the", "major", "current", "recent", "research", "trends",
-    "trend", "in", "of", "for", "and", "or", "a", "an", "is", "on", "to",
-    "which", "how", "why", "does", "do", "open", "problems", "problem",
-    "directions", "direction", "gaps", "gap", "main", "most", "important",
-    "unresolved", "emerging", "latest", "state", "art", "field", "recently",
-    "used", "use", "using", "study", "studies", "paper", "papers", "there",
-}
-
-
 def build_query(question: str, max_terms: int = 8) -> str:
     """Content words, space-separated.
 
@@ -60,11 +51,17 @@ def build_query(question: str, max_terms: int = 8) -> str:
     rather than narrow to nothing, which is the opposite of PubMed's behaviour
     — so this keeps more of them.
     """
-    words = [
-        w for w in re.findall(r"[A-Za-z][A-Za-z0-9-]+", question.lower())
-        if w not in _STOP and len(w) >= 2
-    ]
-    return " ".join(words[:max_terms])
+    # Expansions are simply appended here. Where arXiv and PubMed need an OR
+    # group because their terms are ANDed, a ranked match treats an extra term
+    # as extra evidence for what the question is about, so "llm large language
+    # model" ranks the papers that say either — and the ones that say both
+    # highest, which is right.
+    out: list[str] = []
+    for w in query.terms(question, max_terms=max_terms):
+        for form in query.expand(w):
+            if form not in out:
+                out.append(form)
+    return " ".join(out)
 
 
 def reconstruct_abstract(inverted: dict[str, list[int]] | None) -> str:

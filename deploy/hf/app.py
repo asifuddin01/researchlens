@@ -45,7 +45,9 @@ import gradio as gr  # noqa: E402
 from researchlens.config import Settings  # noqa: E402
 from researchlens.engine import Engine  # noqa: E402
 from researchlens.generate.citations import is_grounded, resolve  # noqa: E402
-from researchlens.generate.prompt import NO_EVIDENCE, build_prompt  # noqa: E402
+from researchlens.generate.prompt import (  # noqa: E402
+    NO_EVIDENCE, build_prompt, asks_for_a_survey,
+)
 from researchlens.generate.provider import GenerationRequest  # noqa: E402
 from researchlens.live.arxiv import is_live  # noqa: E402
 from researchlens.uploads import (  # noqa: E402
@@ -650,6 +652,15 @@ def ask_json(
     # `Citation` records the marker and the quote, not the origin URL.
     links = {r.chunk.chunk_id: r.chunk.url for r in evidence if r.chunk.url}
     from_site = [r for r in evidence if r.chunk.chunk_id.startswith("site:")]
+    # A recency question answered from a fixed corpus, with the reader never
+    # told that Local is why. The prompt already makes the model add a clause
+    # about it, which is buried in the prose and says nothing about what to do.
+    # Reported as a flag so the page can offer the fix instead.
+    stranded = (
+        asks_for_a_survey(question)
+        and want_live is False
+        and not any(is_live(r.chunk.chunk_id) for r in evidence)
+    )
 
     started = time.perf_counter()
     try:
@@ -689,6 +700,7 @@ def ask_json(
             "passages": len(evidence),
             "papers": len({r.chunk.doc_id for r in evidence}),
             "about_author": bool(from_site),
+            "asks_current_but_local": stranded,
         }
     generation_ms = (time.perf_counter() - started) * 1000.0
 
@@ -722,6 +734,7 @@ def ask_json(
         # literature. A reader deserves to know a self-description is what
         # they are reading before they decide how much to trust it.
         "about_author": bool(from_site),
+        "asks_current_but_local": stranded,
     }
 
 

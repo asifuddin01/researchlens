@@ -25,6 +25,7 @@ from datetime import date, timedelta
 
 import httpx
 
+from researchlens.live import query
 from researchlens.live.arxiv import LivePaper
 
 BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
@@ -39,16 +40,6 @@ _last_call = 0.0
 _TOOL = "ResearchLens"
 _EMAIL = "researchlens@users.noreply.github.com"
 
-_STOP = {
-    "what", "are", "the", "major", "current", "recent", "research", "trends",
-    "trend", "in", "of", "for", "and", "or", "a", "an", "is", "on", "to",
-    "which", "how", "why", "does", "do", "open", "problems", "problem",
-    "directions", "direction", "gaps", "gap", "main", "most", "important",
-    "unresolved", "emerging", "latest", "state", "art", "field", "recently",
-    "used", "use", "using", "study", "studies", "paper", "papers",
-}
-
-
 def _clean(text: str | None) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip()
 
@@ -56,15 +47,28 @@ def _clean(text: str | None) -> str:
 def build_query(question: str, max_terms: int = 5) -> str:
     """Turn a question into a PubMed query.
 
-    Two-letter tokens are kept when they are not stopwords. Requiring three
-    characters silently dropped "AI" from "What are the major open problems in
-    AI for radiology?", leaving the single term "radiology" — which, sorted by
-    date, returned tantalum implants and cognitive-ability studies. A dropped
-    acronym is not a small loss when the acronym is the subject.
+    Content words come from `researchlens.live.query`, which keeps two-letter
+    tokens: requiring three characters silently dropped "AI" from "the major
+    open problems in AI for radiology", leaving "radiology" alone — which,
+    sorted by date, returned tantalum implants. A dropped acronym is not a
+    small loss when the acronym is the subject.
+
+    Terms are ANDed, so an expansion is a parenthesised OR rather than another
+    term, for the same reason as arXiv: demanding both forms is narrower than
+    the acronym alone.
     """
-    words = [w for w in re.findall(r"[A-Za-z][A-Za-z-]+", question.lower())
-             if w not in _STOP and len(w) >= 2]
-    return " AND ".join(words[:max_terms]) or "biomedical research"
+    words = query.terms(question, max_terms=max_terms)
+    if not words:
+        # No subject. "biomedical research" used to stand in here, which
+        # searched for something the reader had not asked about and returned
+        # abstracts that looked like evidence.
+        return ""
+    return " AND ".join(
+        forms[0] if len(forms) == 1 else "(" + " OR ".join(
+            f'"{f}"' if " " in f else f for f in forms
+        ) + ")"
+        for forms in (query.expand(w) for w in words)
+    )
 
 
 async def _throttle() -> None:
@@ -101,6 +105,8 @@ async def search(
 ) -> list[LivePaper]:
     """Fetch recent PubMed records matching a question."""
     term = build_query(question)
+    if not term:
+        return []
     if since_days:
         start = (date.today() - timedelta(days=since_days)).strftime("%Y/%m/%d")
         term = f"({term}) AND (\"{start}\"[Date - Publication] : \"3000\"[Date - Publication])"

@@ -21,6 +21,7 @@ from researchlens.config import Settings
 from researchlens.generate.citations import is_grounded, resolve
 from researchlens.generate.prompt import NO_EVIDENCE, asks_for_a_survey
 from researchlens.live.author import asks_about_the_author
+from researchlens.live.query import asks_for_limitations
 from researchlens.generate.provider import GenerationRequest
 from researchlens.ingest.chunk import chunk_corpus
 from researchlens.ingest.library import load_library
@@ -548,6 +549,102 @@ class Engine:
             question, fetched, corpus, slots, 1, 2, SERVING.top_k, floor_gap=1.5
         )
 
+    #: What a paper looks like when it is admitting something.
+    #:
+    #: Headings first, because a section called "Limitations" is the authors
+    #: putting it on the record. But most papers have no such section and
+    #: concede in prose instead — "we do not evaluate", "remains an open
+    #: question", "our method fails when" — so the text is searched too.
+    _LIMITATION_CUE = re.compile(
+        r"limitation|shortcoming|drawback|caveat|weakness|"
+        r"future work|threats?\s+to\s+validity|"
+        r"we\s+(?:do|did|could)\s+not|"
+        r"(?:remains?|leaves?)\s+(?:an?\s+)?open|"
+        r"(?:is|are|was|were)\s+not\s+(?:evaluat|test|address|explor|valid)|"
+        r"fails?\s+(?:to|when|on)|"
+        r"restricted\s+to|constrained\s+by|only\s+considers?",
+        re.I,
+    )
+
+    #: Where a concession is not a concession. A caption saying a method
+    #: "fails on" one of six examples is describing a figure, not stating the
+    #: bounds of the work, and 165 of the 678 cue matches in this corpus are
+    #: captions and table cells. They can still be retrieved on merit; they
+    #: just do not get a slot reserved for them.
+    _NOT_A_CONCESSION = frozenset({"figure", "table", "title", "references"})
+
+    @classmethod
+    def _states_a_limitation(cls, r: Retrieved) -> bool:
+        c = r.chunk
+        if c.section_kind in cls._NOT_A_CONCESSION:
+            return False
+        return bool(
+            cls._LIMITATION_CUE.search(c.section_heading)
+            or cls._LIMITATION_CUE.search(c.text)
+        )
+
+    def _merge_limitations(
+        self, question: str, pool: list[Retrieved]
+    ) -> list[Retrieved]:
+        """Give the passages where authors concede something guaranteed room.
+
+        Asked what is wrong with a method, ordinary retrieval returns the
+        passages that describe it best — which are the ones written to persuade
+        you it works. A limitations section is topically *further* from the
+        question than the method section it follows, and loses to it, so the
+        honest answer is the one least likely to be retrieved.
+
+        Reserving slots for it is the same move live search and the author
+        corpus already make, and for the same reason: evidence a reader has a
+        reason to want, which the cross-encoder would otherwise rank below
+        something merely more on-topic.
+
+        What this does *not* do is decide whether a limitation is real. It
+        finds the places a paper is talking about its own bounds and puts them
+        in front of the model, which then reports them as the authors' words.
+        Nothing here judges the work.
+        """
+        stated = [r for r in pool if self._states_a_limitation(r)]
+        rest = [r for r in pool if not self._states_a_limitation(r)]
+        if not stated or self.pipeline is None or self.pipeline.reranker is None:
+            return pool[: SERVING.top_k]
+
+        # The floor here is measured against the *stated* pool, not against the
+        # best passage overall — which is the opposite of what live search and
+        # the author corpus do, and deliberately so.
+        #
+        # Their reserved items compete with the corpus on the same ground: an
+        # abstract about the question either speaks to it or does not. A
+        # concession does not compete on that ground at all. It is topically
+        # further from the question by construction, so comparing it to the
+        # most on-topic passage penalises it for being the thing that was
+        # asked for. Measured directly: on "what limitations do the authors
+        # state for RAG", the best non-concession was a figure caption at
+        # +5.34, while the four real concessions — including a section
+        # literally titled "Conclusion & Limitation" — sat at +2.53 to +1.15.
+        # A cross-pool floor of 2.5 dropped every one of them.
+        #
+        # Within the stated pool the boundary is obvious and the gap is wide:
+        # +1.15 to -5.42 between the last useful concession and the first
+        # irrelevant one. So the pool is cut against its own best.
+        ranked = self.pipeline.reranker.rerank(
+            question, [r.chunk for r in stated], len(stated)
+        )
+        if ranked:
+            floor = ranked[0][1] - 4.0
+            keep = {cid for cid, score in ranked if score >= floor}
+            stated = [r for r in stated if r.chunk.chunk_id in keep]
+        if not stated:
+            return pool[: SERVING.top_k]
+
+        # Half, not three quarters. A reader asking what is wrong with a method
+        # still needs to be told what the method is, or the answer is a list of
+        # caveats about something unnamed.
+        slots = min(len(stated), max(3, SERVING.top_k // 2))
+        return self._merge_reserved(
+            question, stated, rest, slots, 2, 2, SERVING.top_k
+        )
+
     def _merge_author(
         self, question: str, about: list[Retrieved], corpus: list[Retrieved]
     ) -> list[Retrieved]:
@@ -677,7 +774,20 @@ class Engine:
         different evidence from one waiting for it, with nothing to indicate
         which they were reading.
         """
-        evidence, retrieval_ms = self.retrieve(question, doc_ids=doc_ids, session=session)
+        # A question about limitations needs a wider net before it is narrowed.
+        # The passages that concede something sit below the ones that explain
+        # the method, so at top_k there are often none left to reserve a slot
+        # for — the split has to happen over a pool deep enough to contain
+        # them. 24 rather than 8; the extra cost is one rerank pass.
+        wants_limits = asks_for_limitations(question)
+        evidence, retrieval_ms = self.retrieve(
+            question,
+            top_k=SERVING.top_k * 3 if wants_limits else None,
+            doc_ids=doc_ids,
+            session=session,
+        )
+        if wants_limits:
+            evidence = self._merge_limitations(question, evidence)
 
         # Whether to reach outside the corpus is decided from the shape of the
         # question, not from a flag someone has to remember to set. A question

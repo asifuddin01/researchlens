@@ -195,6 +195,28 @@ async def main_async(args) -> int:
                 not any(r.chunk.chunk_id.startswith("site:") for r in technical),
             )
 
+    # --- limitations ----------------------------------------------------
+    #
+    # Corpus-only, so it runs whether or not live search was asked for. The
+    # thing being checked is that a passage where authors concede something
+    # reaches the prompt at all: ordinary retrieval ranks it below the method
+    # section it follows, because a limitations section is topically further
+    # from the question than the work it qualifies.
+    lim_q = "what limitations do the authors state for retrieval-augmented generation?"
+    lim_ev, _ms = await engine.evidence_for(lim_q)
+    conceded = [r for r in lim_ev if Engine._states_a_limitation(r)]
+    check(
+        "a question about limitations reaches passages that state one",
+        bool(conceded),
+        f"{len(conceded)} of {len(lim_ev)} passages concede something"
+        + (f" — top: {conceded[0].chunk.section_heading[:40]}" if conceded else ""),
+    )
+    check(
+        "a caption is not mistaken for a concession",
+        all(r.chunk.section_kind not in Engine._NOT_A_CONCESSION for r in conceded),
+        fatal=False,
+    )
+
     return _summary()
 
 

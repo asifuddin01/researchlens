@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from researchlens.live.arxiv import is_live
 from researchlens.live.author import asks_about_the_author
+from researchlens.live.query import asks_for_limitations
 from researchlens.types import Retrieved
 
 SYSTEM = """You answer questions using only the numbered passages provided.
@@ -170,6 +171,22 @@ def build_prompt(question: str, evidence: list[Retrieved], history=None) -> tupl
                 "this is a fixed set of indexed papers rather than a survey of "
                 "current literature.\n"
             )
+
+    # Limitations are a question shape, not a topic, and the instruction only
+    # applies when one is asked for — added here rather than to SYSTEM because
+    # a rule in SYSTEM is paid for by every other question. Measured earlier in
+    # this file's history: nine lines added to SYSTEM stopped a 3B model citing
+    # at all, and the answer was refused for being ungrounded.
+    if asks_for_limitations(question):
+        scope += (
+            "\nThis question asks what is wrong with the work, so answer it in "
+            "the authors' own terms: report the limitations, caveats and future "
+            "work that the passages themselves state, and attribute each to the "
+            "paper it came from. Do not add weaknesses of your own, however "
+            "reasonable — an unstated limitation is your opinion, not a finding. "
+            "If a passage concedes nothing, say that the passages do not state "
+            "the limitations rather than supplying some.\n"
+        )
 
     user = f"""Passages:
 

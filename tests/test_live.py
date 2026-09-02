@@ -34,9 +34,18 @@ def test_pubmed_keeps_short_acronyms():
     assert "radiology" in q
 
 
-def test_a_query_with_only_stopwords_still_produces_something():
-    assert arxiv.build_query("what are the current trends?")
-    assert pubmed.build_query("what are the current trends?")
+def test_a_query_with_only_stopwords_searches_for_nothing():
+    """This used to assert the opposite, and the opposite was wrong.
+
+    The concern was real — never send a malformed query to an API — but the
+    fix was to invent a subject, arXiv falling back to "machine learning" and
+    PubMed to "biomedical research". That searched for something the reader
+    had not asked about and returned abstracts that entered the evidence like
+    any other. The concern is better served by not making the request: both
+    builders now return "" and both `search` functions return [] on it.
+    """
+    assert arxiv.build_query("what are the current trends?") == ""
+    assert pubmed.build_query("what are the current trends?") == ""
 
 
 # --- adapting to chunks -----------------------------------------------------

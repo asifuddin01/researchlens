@@ -32,6 +32,7 @@ from datetime import date, timedelta
 
 import httpx
 
+from researchlens.live import query
 from researchlens.types import Chunk
 
 API = "https://export.arxiv.org/api/query"
@@ -70,20 +71,30 @@ def build_query(question: str, max_terms: int = 6) -> str:
 
     Deliberately crude. arXiv's search is lexical, so the useful signal is the
     content words; adding more only narrows the result set until it is empty.
-    Question scaffolding ("what are the major current research trends in…")
-    matches nothing and is dropped.
+    Question scaffolding is dropped — see `researchlens.live.query`, which is
+    the one place that decides what counts as scaffolding, because three copies
+    of that judgement had already disagreed.
+
+    Terms are ANDed, so an expanded acronym must be an OR group inside its own
+    term rather than a term of its own: `all:"llm" AND all:"large language
+    model"` demands both, which is narrower than asking for either and is the
+    opposite of what expanding it is for.
     """
-    stop = {
-        "what", "are", "the", "major", "current", "recent", "research", "trends",
-        "trend", "in", "of", "for", "and", "or", "a", "an", "is", "on", "to",
-        "which", "how", "why", "does", "do", "open", "problems", "problem",
-        "directions", "direction", "gaps", "gap", "main", "most", "important",
-        "unresolved", "emerging", "latest", "state", "art", "field", "recently",
-    }
-    words = [w for w in re.findall(r"[A-Za-z][A-Za-z-]{2,}", question.lower())
-             if w not in stop]
-    terms = words[:max_terms] or words[:3] or ["machine learning"]
-    return " AND ".join(f'all:"{t}"' for t in terms)
+    words = query.terms(question, max_terms=max_terms)
+    if not words:
+        # No subject to search for. Returning "" rather than inventing one:
+        # a fallback of "machine learning" quietly answered a different
+        # question than the reader asked, and live evidence that is merely
+        # plausible is exactly what this project exists not to produce.
+        return ""
+    groups = []
+    for w in words:
+        forms = query.expand(w)
+        if len(forms) == 1:
+            groups.append(f'all:"{forms[0]}"')
+        else:
+            groups.append("(" + " OR ".join(f'all:"{f}"' for f in forms) + ")")
+    return " AND ".join(groups)
 
 
 async def search(
@@ -105,8 +116,10 @@ async def search(
         await asyncio.sleep(wait)
     _last_call = asyncio.get_event_loop().time()
 
-    query = build_query(question)
-    terms = query.count(" AND ") + 1
+    q = build_query(question)
+    if not q:
+        return []
+    terms = q.count(" AND ") + 1
 
     # A broad query sorted by date is noise. "What is the current research
     # trend in LLMs?" reduces to the single term "llm" once the question words
@@ -123,10 +136,10 @@ async def search(
         order = {"sortBy": "relevance", "sortOrder": "descending"}
         if since_days:
             start = (date.today() - timedelta(days=since_days)).strftime("%Y%m%d")
-            query = f"({query}) AND submittedDate:[{start}0000 TO 999912312359]"
+            q = f"({q}) AND submittedDate:[{start}0000 TO 999912312359]"
 
     params = {
-        "search_query": query,
+        "search_query": q,
         "start": "0",
         "max_results": str(max_results),
         **order,
