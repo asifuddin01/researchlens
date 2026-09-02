@@ -195,6 +195,49 @@ async def main_async(args) -> int:
                 not any(r.chunk.chunk_id.startswith("site:") for r in technical),
             )
 
+        # --- the Elementa ------------------------------------------------
+        #
+        # The author's own textbook, fetched from the same site. Split the same
+        # way as live search: whether it reaches the prompt is this system's to
+        # guarantee, whether the model writes from it is the model's business.
+        from researchlens.live import elementa as elementa_source
+
+        book = await elementa_source.fetch()
+        check(
+            "the Elementa is reachable",
+            bool(book),
+            f"{len(book)} passages from {elementa_source.CORPUS_URL}"
+            + (f" — {elementa_source.last_error}" if elementa_source.last_error else ""),
+            fatal=False,
+        )
+        if book:
+            check(
+                "propositions are not labelled as papers",
+                all(c.pages == "proposition" for c in book),
+                fatal=False,
+            )
+            check(
+                "every passage of a proposition is separately citable",
+                len({c.chunk_id for c in book}) == len(book),
+            )
+            taught, _ms = await engine.evidence_for(
+                "what is a hidden layer actually doing?"
+            )
+            reached = [r for r in taught if r.chunk.chunk_id.startswith("elementa:")]
+            check(
+                "the textbook reaches the prompt on a conceptual question",
+                bool(reached),
+                f"{len(reached)} propositions, top: "
+                + (reached[0].chunk.doc_title[:44] if reached else "none"),
+                fatal=False,
+            )
+            # The textbook is about the material, not about the person.
+            about_author, _ms = await engine.evidence_for("who is Asif?")
+            check(
+                "the textbook stays out of a question about the author",
+                not any(r.chunk.chunk_id.startswith("elementa:") for r in about_author),
+            )
+
     # --- limitations ----------------------------------------------------
     #
     # Corpus-only, so it runs whether or not live search was asked for. The

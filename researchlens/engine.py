@@ -90,6 +90,7 @@ class Engine:
         #: broken live path is visible rather than merely quiet.
         self.last_live_error: str | None = None
         self.last_author_error: str | None = None
+        self.last_elementa_error: str | None = None
         self._bundle_matrix = None
 
     # ---- startup ---------------------------------------------------------
@@ -340,6 +341,21 @@ class Engine:
         self.last_live_error = None
         return [Retrieved(chunk=c, score=0.0, sources=frozenset({"live"}))
                 for c in arxiv.to_chunks(papers)]
+
+    async def elementa_evidence(self) -> list[Retrieved]:
+        """The author's textbook, fetched from the site he publishes it on.
+
+        Not part of the author corpus: that answers who wrote this, and this
+        answers how the thing works. Kept apart so a question about attention
+        does not compete with a biography, and a question about the author does
+        not return eighty-three propositions.
+        """
+        from researchlens.live import elementa as elementa_source
+
+        chunks = await elementa_source.fetch()
+        self.last_elementa_error = elementa_source.last_error
+        return [Retrieved(chunk=c, score=0.0, sources=frozenset({"elementa"}))
+                for c in chunks]
 
     async def author_evidence(self) -> list[Retrieved]:
         """What the author's site says about the author.
@@ -694,6 +710,27 @@ class Engine:
             reserved_question=resolve_anaphora(question),
         )
 
+    def _merge_elementa(
+        self, question: str, teaching: list[Retrieved], corpus: list[Retrieved]
+    ) -> list[Retrieved]:
+        """Give the textbook room to be the answer, without letting it be one.
+
+        Two slots, against live search's four and the author corpus's six. The
+        Elementa is genuinely relevant to a technical question — it is a
+        textbook on exactly this material — but it is the author explaining
+        something, not a paper reporting it, and an answer built mostly from
+        one person's teaching notes would be a narrower answer than the corpus
+        can give. Two passages is enough to contribute and not enough to carry.
+
+        The floor is the same guard live search uses: a proposition scoring far
+        below the best paper drops out rather than occupying a slot it earned
+        by category rather than by relevance.
+        """
+        slots = min(len(teaching), 2)
+        return self._merge_reserved(
+            question, teaching, corpus, slots, 1, 3, SERVING.top_k, floor_gap=1.5
+        )
+
     def _merge_reserved(
         self,
         question: str,
@@ -831,6 +868,20 @@ class Engine:
             fetched = await self.live_evidence(question)
             if fetched:
                 evidence = self._merge_live(question, fetched, evidence)
+
+        # The textbook is consulted on questions about the subject matter —
+        # which is to say, not on questions about the author, and not when the
+        # reader has chosen their own sources. It gets a small reserved
+        # allocation with a floor rather than free rein: it should appear when
+        # it is the best answer and stay out when a paper is.
+        if (
+            not asks_about_the_author(question)
+            and not doc_ids
+            and not self.uploaded_documents(session)
+        ):
+            teaching = await self.elementa_evidence()
+            if teaching:
+                evidence = self._merge_elementa(question, teaching, evidence)
 
         # The site is consulted when the question is about the person rather
         # than about a literature, and — unlike live search — regardless of

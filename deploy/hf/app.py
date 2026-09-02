@@ -690,6 +690,7 @@ def ask_json(
                     "live": is_live(r.chunk.chunk_id),
                     "yours": r.chunk.doc_id in mine,
                     "site": r.chunk.chunk_id.startswith("site:"),
+                    "textbook": r.chunk.chunk_id.startswith("elementa:"),
                     "url": r.chunk.url or "",
                 }
                 for i, r in enumerate(evidence, start=1)
@@ -721,6 +722,7 @@ def ask_json(
                 "live": is_live(c.chunk_id),
                 "yours": c.chunk_id.split(":", 1)[0] in mine,
                 "site": c.chunk_id.startswith("site:"),
+                "textbook": c.chunk_id.startswith("elementa:"),
                 "url": links.get(c.chunk_id, ""),
             }
             for c in citations

@@ -365,6 +365,7 @@ def _answer_json(answer) -> dict:
                 # The site is not the literature, and a reader should be able
                 # to see which one a claim rests on without opening it.
                 "site": c.chunk_id.startswith("site:"),
+                "textbook": c.chunk_id.startswith("elementa:"),
             }
             for c in answer.citations
         ],

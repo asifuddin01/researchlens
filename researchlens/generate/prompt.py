@@ -40,6 +40,9 @@ Rules:
   work. Answer questions about the author from these, cited like any other.
   It is a self-description, not a reviewed finding. The papers in the other
   passages are ones the author has read, not ones they wrote.
+- A passage marked (AUTHOR'S TEXTBOOK) is the author's own explanation of a
+  topic. Use it to explain, and cite it. It is teaching, not evidence: it does
+  not report a result, and no number in it is a measurement of anything.
 
 If the question asks what is *current*, *recent*, *trending*, or what a field
 is doing now, you are being asked something a fixed set of papers cannot fully
@@ -68,6 +71,10 @@ def _passage_kind(chunk_id: str) -> str:
     # though it reported, measured or found anything.
     if chunk_id.startswith("site:"):
         return "AUTHOR'S OWN WEBSITE"
+    # A proposition from the author's textbook: an explanation he wrote, not a
+    # result anybody measured.
+    if chunk_id.startswith("elementa:"):
+        return "AUTHOR'S TEXTBOOK"
     return "passage"
 
 
