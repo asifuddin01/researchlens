@@ -223,3 +223,64 @@ def test_an_ordinary_question_gets_no_limitations_clause():
         [_r("RAG retrieves passages before generating.")],
     )
     assert "authors' own terms" not in user
+
+
+# --- comparison -------------------------------------------------------------
+
+@pytest.mark.parametrize("q", [
+    "compare my paper with the recent online literature",
+    "how does my paper differ from what is on arxiv",
+    "what is the difference between this and the indexed papers",
+    "how does this contrast with the state of the art",
+])
+def test_comparison_questions_are_recognised(q):
+    assert query.asks_to_compare(q)
+
+
+def test_a_comparison_naming_the_outside_is_distinguished():
+    """"Compare this with the recent literature" is a different request from
+    "compare this with the indexed papers", and answering the first from a
+    fixed corpus is a confident comparison against the wrong evidence."""
+    assert query.compares_with_online("compare my paper with the recent online literature")
+    assert not query.compares_with_online("compare this with the indexed papers")
+
+
+def test_comparison_words_are_not_searched_for():
+    """"compare my paper with the recent online literature on agentic RAG"
+    searched arXiv for `compare AND online AND agentic AND rag`, which returned
+    a video-generation paper. The subject was two words of that sentence."""
+    assert query.terms(
+        "compare my paper with the recent online literature on agentic RAG"
+    ) == ["agentic", "rag"]
+
+
+def test_the_prompt_names_each_side_of_a_comparison():
+    from researchlens.generate.prompt import build_prompt
+
+    ev = [
+        _r("Mine.", "Methods"),
+        _r("An abstract.", "arXiv 1 · abstract"),
+        _r("A corpus passage.", "Results"),
+    ]
+    # Tag the first as the reader's own, the way uploads.py does.
+    ev[0] = Retrieved(chunk=ev[0].chunk, score=0.0, sources=frozenset({"upload"}))
+    ev[1] = Retrieved(
+        chunk=Chunk(
+            chunk_id="arxiv:1", doc_id="arxiv:1", ordinal=0, text="An abstract.",
+            section_kind="abstract", section_heading="arXiv 1", page_start=0,
+            page_end=0, doc_title="A preprint",
+        ),
+        score=0.0,
+    )
+    _sys, user = build_prompt("compare my paper with the online literature", ev)
+    assert "asks for a comparison" in user
+    assert "reader's own uploaded paper" in user
+    assert "1 abstract fetched" in user          # singular, not "1 abstracts"
+    assert "indexed corpus" in user
+
+
+def test_an_ordinary_question_gets_no_comparison_clause():
+    from researchlens.generate.prompt import build_prompt
+
+    _sys, user = build_prompt("what is agentic RAG?", [_r("A passage.")])
+    assert "asks for a comparison" not in user

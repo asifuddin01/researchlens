@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from researchlens.live.arxiv import is_live
 from researchlens.live.author import asks_about_the_author
-from researchlens.live.query import asks_for_limitations
+from researchlens.live.query import asks_for_limitations, asks_to_compare
 from researchlens.types import Retrieved
 
 SYSTEM = """You answer questions using only the numbered passages provided.
@@ -193,6 +193,36 @@ def build_prompt(question: str, evidence: list[Retrieved], history=None) -> tupl
             "reasonable — an unstated limitation is your opinion, not a finding. "
             "If a passage concedes nothing, say that the passages do not state "
             "the limitations rather than supplying some.\n"
+        )
+
+    # A comparison is a shape too. Without this the model summarises whichever
+    # side retrieved best and calls it an answer; the reader asked for both.
+    if asks_to_compare(question):
+        # `sources` carries the tag, not the id: an uploaded document's doc_id
+        # is a content hash with no prefix, exactly like a corpus one, because
+        # the same file uploaded twice must dedupe to the same id. uploads.py
+        # marks the retrieval instead.
+        yours = [r for r in evidence if "upload" in r.sources]
+        live = [r for r in evidence if is_live(r.chunk.chunk_id)]
+        sides = []
+        if yours:
+            sides.append(f"{len(yours)} from the reader's own uploaded paper")
+        if live:
+            n = len(live)
+            sides.append(
+                f"{n} abstract{'' if n == 1 else 's'} fetched just now from "
+                "literature search"
+            )
+        rest = len(evidence) - len(yours) - len(live)
+        if rest:
+            sides.append(f"{rest} from the indexed corpus")
+        scope += (
+            "\nThis question asks for a comparison. The passages above are "
+            + ", ".join(sides) + ". Say what each side holds and where they "
+            "agree or differ, naming which is which — a reader comparing their "
+            "own paper with the literature needs to know which passage came "
+            "from where, and a comparison drawn from one side only is not one. "
+            "Where a side is missing or thin, say so rather than filling it in.\n"
         )
 
     user = f"""Passages:

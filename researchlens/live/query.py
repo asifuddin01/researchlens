@@ -60,6 +60,13 @@ STOP = {
     "problem", "problems", "gap", "gaps", "challenge", "challenges",
     "question", "questions", "open", "unresolved", "major", "main", "most",
     "important", "key", "good", "best", "common", "existing",
+    # asking for a comparison rather than naming a subject
+    "compare", "compared", "comparison", "versus", "vs", "differ", "differs",
+    "difference", "differences", "contrast", "against", "similar", "similarity",
+    "same", "better", "worse", "instead",
+    # pointing at something already in hand, or at where to look
+    "online", "offline", "local", "locally", "internet", "web", "elsewhere",
+    "here", "mine", "ours", "theirs",
     # addressing the system
     "tell", "give", "show", "explain", "describe", "list", "find", "me",
     "please", "you", "your", "i", "my", "we", "our", "us",
@@ -146,6 +153,45 @@ _LIMITATION_WORDS = (
     "threats to validity", "future work", "unaddressed", "not addressed",
     "what is wrong", "problems with", "issues with", "critique",
 )
+
+
+#: Asking how one thing stands against another.
+#:
+#: Distinct from asking about a topic: the reader already has a subject in
+#: mind — usually a paper they uploaded — and wants it placed beside something
+#: else. Which "something else" they mean is in the words too: the corpus, the
+#: live literature, or both.
+_COMPARE_WORDS = (
+    "compare", "compared", "comparison", "versus", " vs ", " vs.",
+    "differ", "difference", "differences", "contrast", "how does it stack",
+    "better than", "worse than", "same as", "similar to", "in line with",
+    "against the", "relative to", "how does my", "how does this paper",
+)
+
+#: Where a comparison is pointing when it names a side.
+_ONLINE_WORDS = (
+    "online", "internet", "web", "live", "recent", "current", "latest",
+    "arxiv", "pubmed", "openalex", "literature", "published", "elsewhere",
+    "outside", "state of the art", "state-of-the-art", "others",
+)
+
+
+def asks_to_compare(question: str) -> bool:
+    """Whether the reader wants two things placed side by side."""
+    q = f" {question.lower().strip()} "
+    return any(w in q for w in _COMPARE_WORDS)
+
+
+def compares_with_online(question: str) -> bool:
+    """Whether a comparison names the literature outside the corpus.
+
+    "Compare this with the recent literature" is a different request from
+    "compare this with the indexed papers", and answering the first from a
+    fixed corpus is the failure this project exists to avoid — a confident
+    comparison against evidence that is not what was asked for.
+    """
+    q = f" {question.lower().strip()} "
+    return asks_to_compare(question) and any(w in q for w in _ONLINE_WORDS)
 
 
 def asks_for_limitations(question: str) -> bool:

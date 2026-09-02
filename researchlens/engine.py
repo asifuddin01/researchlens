@@ -23,7 +23,7 @@ from researchlens.config import Settings
 from researchlens.generate.citations import is_grounded, resolve
 from researchlens.generate.prompt import NO_EVIDENCE, asks_for_a_survey
 from researchlens.live.author import asks_about_the_author
-from researchlens.live.query import asks_for_limitations
+from researchlens.live.query import asks_for_limitations, compares_with_online
 from researchlens.generate.provider import GenerationRequest
 from researchlens.ingest.chunk import chunk_corpus
 from researchlens.ingest.library import load_library
@@ -616,7 +616,11 @@ class Engine:
         return kept
 
     def _merge_live(
-        self, question: str, fetched: list[Retrieved], corpus: list[Retrieved]
+        self,
+        question: str,
+        fetched: list[Retrieved],
+        corpus: list[Retrieved],
+        comparing: bool = False,
     ) -> list[Retrieved]:
         """Combine live and corpus evidence, keeping only what is relevant.
 
@@ -652,7 +656,8 @@ class Engine:
         # One live abstract per paper: six abstracts from six papers is a view
         # of the field, which is what a survey question asked for.
         return self._merge_reserved(
-            question, fetched, corpus, slots, 1, 2, SERVING.top_k, floor_gap=1.5
+            question, fetched, corpus, slots, 1, 2, SERVING.top_k,
+            floor_gap=None if comparing else 1.5,
         )
 
     #: What a paper looks like when it is admitting something.
@@ -1024,7 +1029,23 @@ class Engine:
         if live:
             fetched = await self.live_evidence(question)
             if fetched:
-                evidence = self._merge_live(question, fetched, evidence)
+                evidence = self._merge_live(
+                    question, fetched, evidence,
+                    # A reader asking to compare their paper with what is
+                    # online has named the side they want, so it is not the
+                    # floor's business to decide it is off-topic.
+                    #
+                    # The floor exists because a live abstract has to earn its
+                    # slot against the best corpus passage. Here it cannot: an
+                    # uploaded paper scores enormously on a question about
+                    # itself — that is what _merge_uploaded is for — and the
+                    # floor is then set so high that every live result dies.
+                    # Measured on "compare my paper with the recent online
+                    # literature on agentic RAG": 4 citations came back, 2 from
+                    # the upload and 2 from the corpus, and 0 live, on a
+                    # question whose whole point was the online half.
+                    comparing=compares_with_online(question),
+                )
 
         # The textbook is consulted on questions about the subject matter —
         # which is to say, not on questions about the author, and not when the
