@@ -175,6 +175,26 @@ def test_a_caption_does_not_count():
     )
 
 
+def test_a_page_limit_is_not_a_research_limitation():
+    """The lexical false friend that led an answer on the live Space.
+
+    An AutoGen caption reading "Due to the page limit, details of the
+    evaluation are in Appendix D" scored +5.34 against "what limitations do
+    the authors state" — more than double the next passage — because a
+    cross-encoder sees "limit". A page limit is a fact about a conference
+    template, not about the work. Captions leave the pool entirely on this
+    question, which is what keeps it out.
+    """
+    caption = _r(
+        "Due to the page limit, details of the evaluation, including case "
+        "studies in three scenarios, are in Appendix D.",
+        "Figure 3: Six examples of diverse applications",
+        "figure",
+    )
+    assert not Engine._states_a_limitation(caption)
+    assert caption.chunk.section_kind in Engine._NOT_A_CONCESSION
+
+
 def test_an_ordinary_passage_does_not_count():
     assert not Engine._states_a_limitation(
         _r("We train a ConvNeXt V2 backbone on six public datasets.")

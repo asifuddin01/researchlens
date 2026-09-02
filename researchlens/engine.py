@@ -604,6 +604,23 @@ class Engine:
         in front of the model, which then reports them as the authors' words.
         Nothing here judges the work.
         """
+        # Captions and table cells leave the pool entirely on this question,
+        # not merely the reserved half of it.
+        #
+        # Excluding them from the reserved pool alone was not enough, and the
+        # reason is a lexical false friend: an AutoGen caption reading "Due to
+        # the page limit, details of the evaluation are in Appendix D" scored
+        # +5.34 against "what limitations do the authors state", more than
+        # double the next passage, because a cross-encoder sees "limit". It
+        # then led the answer — a publishing constraint presented as a finding
+        # about the work. A page limit is a fact about a conference template.
+        #
+        # On any other question a caption can be the answer, so this is scoped
+        # to this one, and only while enough prose survives to answer from.
+        prose = [r for r in pool if r.chunk.section_kind not in self._NOT_A_CONCESSION]
+        if len(prose) >= SERVING.top_k:
+            pool = prose
+
         stated = [r for r in pool if self._states_a_limitation(r)]
         rest = [r for r in pool if not self._states_a_limitation(r)]
         if not stated or self.pipeline is None or self.pipeline.reranker is None:
