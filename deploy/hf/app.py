@@ -547,6 +547,9 @@ def corpus_stats() -> dict:
     woke up. It does not wait for one: the count moves on the next load, which
     is the right trade for a number in a header.
     """
+    # Read before starting a refresh: one that finds nothing new is alive for a
+    # moment, and would read as "indexing" on every call.
+    indexing = ENGINE.library_refreshing
     ENGINE.ensure_library_fresh()
     lib = ENGINE.library.stats() if ENGINE.library else {"documents": 0, "passages": 0}
     return {
@@ -555,6 +558,13 @@ def corpus_stats() -> dict:
         "model": GPU_MODEL if ON_ZERO_GPU else ENGINE.settings.ollama_model,
         "sources": ["arxiv", "pubmed", "openalex"],
         "added": lib["documents"],
+        # The site records this figure on a schedule. Mid-refresh it is the
+        # papers read so far — after a restart, none of the library — and a
+        # figure recorded then would go backwards. So it says so.
+        "indexing": indexing,
+        # A paper listed in the CMS that could not be read is otherwise only a
+        # count one short, with nothing to say which or why.
+        "skipped": lib.get("skipped", []),
     }
 
 

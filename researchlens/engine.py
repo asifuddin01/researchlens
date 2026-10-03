@@ -238,6 +238,12 @@ class Engine:
     def ready(self) -> bool:
         return self.pipeline is not None and bool(self.chunks)
 
+    @property
+    def library_refreshing(self) -> bool:
+        """Whether the library is being re-read right now, so a count of it is partial."""
+        t = self._library_thread
+        return t is not None and t.is_alive()
+
     # ---- providers -------------------------------------------------------
 
     def provider(self, name: str):

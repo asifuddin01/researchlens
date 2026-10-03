@@ -23,6 +23,7 @@ rather than enforced silently.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from dataclasses import replace
@@ -51,6 +52,10 @@ _TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
 #: (fetched_at, manifest_etag, documents, chunks)
 _CACHE: tuple[float, str | None, list[Document], list[Chunk]] | None = None
+#: Papers already parsed, by their bytes and the metadata applied to them. A
+#: book takes minutes to parse on the Space, and re-parsing every paper each
+#: time the manifest changed is what kept new ones from ever arriving.
+_PARSED: dict[tuple, tuple[Document, list[Chunk]]] = {}
 _LAST_ERROR_AT: float = 0.0
 
 last_error: str | None = None
@@ -126,7 +131,7 @@ def _index(raw: bytes, meta: dict) -> tuple[Document, list[Chunk]] | None:
 
 async def fetch(url: str | None = None, force: bool = False) -> tuple[list[Document], list[Chunk]]:
     """The library as documents and passages. Never raises."""
-    global _CACHE, _LAST_ERROR_AT, last_error
+    global _CACHE, _LAST_ERROR_AT, _PARSED, last_error
 
     target = url or MANIFEST_URL
     now = time.monotonic()
@@ -166,18 +171,26 @@ async def fetch(url: str | None = None, force: bool = False) -> tuple[list[Docum
 
     docs: list[Document] = []
     chunks: list[Chunk] = []
+    parsed: dict[tuple, tuple[Document, list[Chunk]]] = {}
     for meta, raw in zip(listed, blobs):
         if raw is None:
             continue
-        got = _index(raw, meta)
+        key = (
+            hashlib.sha256(raw).hexdigest(),
+            meta.get("title"), meta.get("authors"), meta.get("url"),
+        )
+        got = _PARSED.get(key) or _index(raw, meta)
         if got is None:
             continue
+        parsed[key] = got
         doc, cs = got
         docs.append(doc)
         chunks.extend(cs)
 
     last_error = None
     _CACHE = (now, r.headers.get("ETag"), docs, chunks)
+    # Only what is still listed, so a removed paper does not stay in memory.
+    _PARSED = parsed
     return docs, chunks
 
 
@@ -185,6 +198,7 @@ def reset_cache() -> None:
     """Drop the cache. For tests, and for a deliberate refresh."""
     global _CACHE, _LAST_ERROR_AT, last_error
     _CACHE = None
+    _PARSED.clear()
     _LAST_ERROR_AT = 0.0
     last_error = None
     skipped.clear()

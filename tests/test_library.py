@@ -248,6 +248,25 @@ def test_an_unchanged_manifest_does_not_redownload(monkeypatch):
     assert kept[1], "and should keep the passages"
 
 
+def test_an_added_paper_is_the_only_one_parsed(monkeypatch):
+    """A book takes minutes to parse on the Space. Re-reading every listed
+    paper whenever one was added is what kept the new ones from arriving."""
+    parse, calls = _parses_as({
+        "Rank Radii Transfer as Quantiles": _doc("aaa", "R"),
+        "A Scoping Review of HCGT-PG": _doc("bbb", "S"),
+    })
+    monkeypatch.setattr(source, "parse_bytes", parse)
+    first = {**MANIFEST, "documents": MANIFEST["documents"][:1]}
+    monkeypatch.setattr(httpx, "AsyncClient", _client(_serve(first, etag="e1")))
+    asyncio.run(source.fetch())
+    assert calls["n"] == 1
+
+    monkeypatch.setattr(httpx, "AsyncClient", _client(_serve(MANIFEST, etag="e2")))
+    docs, _ = asyncio.run(source.fetch(force=True))
+    assert calls["n"] == 2, "only the added paper should be parsed"
+    assert {d.doc_id for d in docs} == {"aaa", "bbb"}
+
+
 def test_a_stale_library_beats_no_library(monkeypatch):
     state = {"n": 0}
     parse, _ = _parses_as({"Rank Radii Transfer as Quantiles": _doc("aaa", "R")})
