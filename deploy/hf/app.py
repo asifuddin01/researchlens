@@ -35,7 +35,10 @@ warnings.filterwarnings("ignore")
 # the import works unaided. Run from `deploy/hf/` during development it does
 # not, and a file that only runs where it is deployed cannot be tested before
 # it is deployed.
-for candidate in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[2]):
+#
+# Every ancestor, not two named ones: naming `parents[2]` raised IndexError
+# once the Space moved this file to /app/app.py, which has only two.
+for candidate in Path(__file__).resolve().parents:
     if (candidate / "researchlens").is_dir():
         sys.path.insert(0, str(candidate))
         break
